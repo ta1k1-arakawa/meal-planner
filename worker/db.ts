@@ -7,6 +7,7 @@ import type {
   Cycle,
   ShoppingItem,
 } from "./contracts";
+import { recipeItem, renderInstructions } from "./recipe";
 import {
   DomainError,
   nutrition,
@@ -35,7 +36,7 @@ export async function ingredients(db: D1Database) {
 export async function inventory(db: D1Database) {
   return rows<Stock>(
     db,
-    "SELECT i.*,s.quantity,s.version FROM ingredients i JOIN inventory_stocks s ON s.ingredient_id=i.id ORDER BY i.name",
+    "SELECT i.*,s.quantity,s.version FROM ingredients i JOIN inventory_stocks s ON s.ingredient_id=i.id WHERE i.inventory_exempt=0 ORDER BY i.name",
   );
 }
 export async function settings(db: D1Database): Promise<Settings> {
@@ -76,8 +77,15 @@ export async function recipes(db: D1Database): Promise<Recipe[]> {
   return rs.map((r) => {
     const items = lines
       .filter((l) => l.recipe_id === r.id)
-      .map((l) => ({ ingredientId: l.ingredient_id, amount: l.amount }));
-    return { ...r, items, ...nutrition(items, ings) };
+      .map((l) =>
+        recipeItem({ ingredientId: l.ingredient_id, amount: l.amount }, ings),
+      );
+    return {
+      ...r,
+      instructions_json: renderInstructions(r.instructions_json, items),
+      items,
+      ...nutrition(items, ings),
+    };
   });
 }
 export async function plans(db: D1Database): Promise<Plan[]> {
@@ -112,7 +120,7 @@ export async function shopping(
   if (!cycle) return null;
   const items = await rows<ShoppingItem>(
     db,
-    "SELECT si.*,i.name FROM shopping_items si JOIN ingredients i ON i.id=si.ingredient_id WHERE cycle_id=? ORDER BY i.name",
+    "SELECT si.*,i.name FROM shopping_items si JOIN ingredients i ON i.id=si.ingredient_id WHERE cycle_id=? AND i.inventory_exempt=0 ORDER BY i.name",
     cycle.id,
   );
   return { ...cycle, items };
@@ -306,13 +314,13 @@ export async function reconcileShopping(
         p.local_date <= cycle.ends_on,
     )) {
       if (p.local_date < cycle.starts_on) {
-        for (const i of p.recipe.items)
+        for (const i of p.recipe.items.filter((i) => !i.inventory_exempt))
           virtual.set(
             i.ingredientId,
             (virtual.get(i.ingredientId) ?? 0) - i.amount,
           );
       } else {
-        for (const i of p.recipe.items)
+        for (const i of p.recipe.items.filter((i) => !i.inventory_exempt))
           requirements.set(
             i.ingredientId,
             (requirements.get(i.ingredientId) ?? 0) + i.amount,
@@ -328,7 +336,11 @@ export async function reconcileShopping(
         cycle.id,
         cycle.version,
       ),
-      stmt(db, "DELETE FROM shopping_items WHERE cycle_id=?", cycle.id),
+      stmt(
+        db,
+        "DELETE FROM shopping_items WHERE cycle_id=? AND ingredient_id IN (SELECT id FROM ingredients WHERE inventory_exempt=0)",
+        cycle.id,
+      ),
       stmt(
         db,
         "UPDATE shopping_cycles SET version=version+1 WHERE id=?",
@@ -392,7 +404,7 @@ export async function generate(
     proposed_amount: number;
   }>(
     db,
-    "SELECT si.ingredient_id,si.proposed_amount FROM shopping_items si JOIN shopping_cycles sc ON sc.id=si.cycle_id WHERE sc.status='review' AND sc.ends_on<? AND sc.shopping_on>=?",
+    "SELECT si.ingredient_id,si.proposed_amount FROM shopping_items si JOIN shopping_cycles sc ON sc.id=si.cycle_id JOIN ingredients i ON i.id=si.ingredient_id WHERE i.inventory_exempt=0 AND sc.status='review' AND sc.ends_on<? AND sc.shopping_on>=?",
     start,
     tokyoDate(),
   );
@@ -407,7 +419,7 @@ export async function generate(
   for (const p of allPlans.filter(
     (p) => p.local_date < start && ["draft", "planned"].includes(p.status),
   )) {
-    for (const item of p.recipe.items)
+    for (const item of p.recipe.items.filter((i) => !i.inventory_exempt))
       virtual.set(
         item.ingredientId,
         (virtual.get(item.ingredientId) ?? 0) - item.amount,

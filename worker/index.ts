@@ -5,14 +5,18 @@ import { z, ZodError } from "zod";
 import {
   adjustSchema,
   completeSchema,
+  purchaseSchema,
   generateSchema,
   versionSchema,
   settingsSchema,
   dateSchema,
+  type RecipeItem,
+  type AmountItem,
   type NutritionSummary,
 } from "./contracts";
 import { DomainError, tokyoDate, addDays, nutrition } from "./planner";
 import * as db from "./db";
+import { actualItems, recipeItem } from "./recipe";
 export interface Env {
   DB: D1Database;
   APP_PASSWORD: string;
@@ -131,6 +135,9 @@ app.post("/api/auth/logout", (c) => {
   return c.json({ ok: true });
 });
 app.get("/api/inventory", async (c) => c.json(await db.inventory(c.env.DB)));
+app.get("/api/ingredients", async (c) =>
+  c.json(await db.ingredients(c.env.DB)),
+);
 app.get("/api/inventory/movements", async (c) =>
   c.json(
     await db.rows(
@@ -151,7 +158,7 @@ app.put("/api/ingredients/:id/conversion", async (c) => {
     !(await db
       .stmt(
         c.env.DB,
-        "SELECT id FROM ingredients WHERE id=?",
+        "SELECT id FROM ingredients WHERE id=? AND inventory_exempt=0",
         c.req.param("id"),
       )
       .first())
@@ -333,6 +340,7 @@ app.post("/api/plans/:id/complete", async (c) => {
     );
   if (plan.local_date > tokyoDate())
     throw new DomainError("FUTURE_MEAL", "未来の夕食はまだ完了できません", 422);
+  const items = actualItems(body.items, plan.recipe.items, ings);
   const shortages = body.items.filter(
     (i) =>
       i.amount > (stock.find((s) => s.id === i.ingredientId)?.quantity ?? 0),
@@ -344,7 +352,7 @@ app.post("/api/plans/:id/complete", async (c) => {
       409,
       shortages,
     );
-  const totals = nutrition(body.items, ings);
+  const totals = nutrition(items, ings);
   const logId = crypto.randomUUID();
   const projections = await db.reconcileShopping(c.env.DB, {
     skipPlan: planId,
@@ -374,12 +382,12 @@ app.post("/api/plans/:id/complete", async (c) => {
       body.idempotencyKey,
     ),
   ];
-  for (const item of body.items) {
+  for (const item of items) {
     const ing = ings.find((i) => i.id === item.ingredientId)!;
     statements.push(
       db.stmt(
         c.env.DB,
-        "INSERT INTO meal_log_items(id,log_id,ingredient_id,ingredient_name,amount,unit,kcal,protein_g,source,food_code,state) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO meal_log_items(id,log_id,ingredient_id,ingredient_name,amount,unit,kcal,protein_g,source,food_code,state,amount_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         crypto.randomUUID(),
         logId,
         ing.id,
@@ -391,9 +399,10 @@ app.post("/api/plans/:id/complete", async (c) => {
         ing.source,
         ing.food_code,
         ing.state,
+        ing.inventory_exempt === 1 ? "recipe_default" : "actual",
       ),
     );
-    if (item.amount)
+    if (item.amount && ing.inventory_exempt !== 1)
       statements.push(
         db.movement(
           c.env.DB,
@@ -423,7 +432,7 @@ app.get("/api/shopping/current", async (c) =>
   c.json(await db.shopping(c.env.DB, tokyoDate())),
 );
 app.post("/api/shopping/:id/confirm", async (c) => {
-  const b = completeSchema.parse(await c.req.json());
+  const b = purchaseSchema.parse(await c.req.json());
   const id = c.req.param("id");
   const payload = JSON.stringify({ id, ...b });
   const old = await db.replay(c.env.DB, b.idempotencyKey, "purchase", payload);
@@ -448,7 +457,7 @@ app.post("/api/shopping/:id/confirm", async (c) => {
     );
   const si = await db.rows<{ ingredient_id: string }>(
     c.env.DB,
-    "SELECT ingredient_id FROM shopping_items WHERE cycle_id=?",
+    "SELECT si.ingredient_id FROM shopping_items si JOIN ingredients i ON i.id=si.ingredient_id WHERE cycle_id=? AND i.inventory_exempt=0",
     id,
   );
   if (
@@ -556,7 +565,7 @@ app.post("/api/meal-logs/:id/correct", async (c) => {
     );
   const log = await db
     .stmt(c.env.DB, "SELECT * FROM meal_logs WHERE id=?", logId)
-    .first();
+    .first<{ recipe_snapshot: string }>();
   if (!log) throw new DomainError("NOT_FOUND", "記録がありません", 404);
   const latest = await db
     .stmt(
@@ -601,21 +610,57 @@ app.post("/api/meal-logs/:id/correct", async (c) => {
     ? JSON.parse(latest.items_snapshot)
     : initial.map((i) => ({ ingredientId: i.ingredient_id, amount: i.amount }));
   const ingredients = await db.ingredients(c.env.DB);
-  const totals = nutrition(body.items, ingredients);
-  const id = crypto.randomUUID();
-  const snapshot = body.items.map((item) => {
-    const ing = ingredients.find((i) => i.id === item.ingredientId)!;
+  const defaults: (AmountItem & Partial<RecipeItem>)[] = JSON.parse(
+    log.recipe_snapshot,
+  ).items;
+  const items = actualItems(body.items, defaults, ingredients);
+  const snapshotItems = items.map((item) => {
+    const current = recipeItem(item, ingredients);
+    if (!current.inventory_exempt) return current;
+    const saved = defaults.find((i) => i.ingredientId === item.ingredientId);
+    const oldLine = initial.find((i) => i.ingredient_id === item.ingredientId);
     return {
-      ...item,
-      name: ing.name,
-      unit: ing.unit,
-      kcal: (item.amount * ing.kcal_per_100) / 100,
-      protein: (item.amount * ing.protein_per_100) / 100,
-      source: ing.source,
-      foodCode: ing.food_code,
-      state: ing.state,
+      ...current,
+      name: saved?.name ?? current.name,
+      unit: saved?.unit ?? current.unit,
+      source: saved?.source ?? oldLine?.source ?? current.source,
+      food_code: saved?.food_code ?? oldLine?.food_code ?? current.food_code,
+      state: saved?.state ?? oldLine?.state ?? current.state,
+      kcal_per_100:
+        saved?.kcal_per_100 ??
+        (oldLine && oldLine.amount > 0
+          ? (oldLine.kcal * 100) / oldLine.amount
+          : current.kcal_per_100),
+      protein_per_100:
+        saved?.protein_per_100 ??
+        (oldLine && oldLine.amount > 0
+          ? (oldLine.protein_g * 100) / oldLine.amount
+          : current.protein_per_100),
     };
   });
+  const totals = {
+    kcal:
+      Math.round(
+        snapshotItems.reduce(
+          (n, i) => n + (i.amount * i.kcal_per_100) / 100,
+          0,
+        ) * 10,
+      ) / 10,
+    protein:
+      Math.round(
+        snapshotItems.reduce(
+          (n, i) => n + (i.amount * i.protein_per_100) / 100,
+          0,
+        ) * 10,
+      ) / 10,
+  };
+  const id = crypto.randomUUID();
+  const snapshot = snapshotItems.map((item) => ({
+    ...item,
+    kcal: (item.amount * item.kcal_per_100) / 100,
+    protein: (item.amount * item.protein_per_100) / 100,
+    amountSource: item.inventory_exempt ? "recipe_default" : "actual",
+  }));
   const changes = new Map<string, number>();
   for (const ingredientId of new Set([
     ...previous.map((i) => i.ingredientId),
@@ -624,7 +669,11 @@ app.post("/api/meal-logs/:id/correct", async (c) => {
     const delta =
       (previous.find((i) => i.ingredientId === ingredientId)?.amount ?? 0) -
       (body.items.find((i) => i.ingredientId === ingredientId)?.amount ?? 0);
-    if (delta) changes.set(ingredientId, delta);
+    if (
+      delta &&
+      ingredients.find((i) => i.id === ingredientId)?.inventory_exempt !== 1
+    )
+      changes.set(ingredientId, delta);
   }
   const projections = await db.reconcileShopping(c.env.DB, {
     stockDeltas: changes,

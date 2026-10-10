@@ -42,6 +42,15 @@ export const completeSchema = z
     items: itemsSchema,
   })
   .strict();
+export const purchaseSchema = completeSchema.extend({
+  items: z
+    .array(itemSchema)
+    .max(80)
+    .refine(
+      (a) => new Set(a.map((i) => i.ingredientId)).size === a.length,
+      "食材が重複しています",
+    ),
+});
 export const generateSchema = z
   .object({ startDate: dateSchema, allowPurchase: z.boolean().default(false) })
   .strict();
@@ -77,6 +86,21 @@ export interface Ingredient {
   allergens_json: string;
   display_unit: string | null;
   grams_per_display_unit: number | null;
+  inventory_exempt: number;
+}
+export interface AmountItem {
+  ingredientId: string;
+  amount: number;
+}
+export interface RecipeItem extends AmountItem {
+  name: string;
+  unit: "g" | "ml";
+  inventory_exempt: boolean;
+  kcal_per_100: number;
+  protein_per_100: number;
+  source: string;
+  food_code: string;
+  state: string;
 }
 export interface Stock extends Ingredient {
   quantity: number;
@@ -89,7 +113,7 @@ export interface Recipe {
   equipment_json: string;
   instructions_json: string;
   preference_weight: number;
-  items: { ingredientId: string; amount: number }[];
+  items: RecipeItem[];
   kcal: number;
   protein: number;
 }

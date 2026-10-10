@@ -1,11 +1,21 @@
 import { beforeAll, afterAll, beforeEach, describe, expect, it } from "vitest";
 import { Miniflare } from "miniflare";
 import { readFileSync } from "node:fs";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { RecipeDetails } from "../src/RecipeDetails";
+import { ingredients as loadIngredients } from "../worker/db";
+import { eligible, nutrition } from "../worker/planner";
+import type { RecipeItem } from "../worker/contracts";
 import app, { type Env } from "../worker/index";
 import { tokyoDate, cycleEnd, addDays } from "../worker/planner";
 import type { Plan, Cycle, Stock, Settings } from "../worker/contracts";
 let mf: Miniflare, database: D1Database, cookie: string, env: Env;
 let databaseIndex = 0;
+const managedItems = (recipe: Plan["recipe"]) =>
+  recipe.items
+    .filter((i) => !i.inventory_exempt)
+    .map(({ ingredientId, amount }) => ({ ingredientId, amount }));
 async function request(
   path: string,
   body?: unknown,
@@ -74,7 +84,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await mf?.dispose();
 });
-beforeEach(async () => {
+beforeEach(async (context) => {
   database = (await mf.getD1Database(
     "DB_" + databaseIndex++,
   )) as unknown as D1Database;
@@ -83,27 +93,36 @@ beforeEach(async () => {
     "0001_schema.sql",
     "0002_seed.sql",
     "0003_corrections.sql",
+    "0004_pantry_recipe_details.sql",
   ]) {
-    // D1 exec splits lines; individual prepared statements preserve trigger bodies.
-    const sql = readFileSync(
-      new URL("../migrations/" + file, import.meta.url),
-      "utf8",
-    );
-    const triggers = sql.match(/CREATE TRIGGER[\s\S]*?END;/g) ?? [];
-    const plain = sql
-      .replace(/--[^\n]*/g, "")
-      .replace(/CREATE TRIGGER[\s\S]*?END;/g, "");
-    const statements = [
-      ...plain
-        .split(";")
-        .map((s) => s.trim())
-        .filter(Boolean),
-      ...triggers,
-    ].map((sql) => database.prepare(sql));
-    for (let i = 0; i < statements.length; i += 80)
-      await database.batch(statements.slice(i, i + 80));
+    if (
+      file.startsWith("0004") &&
+      context.task.name.startsWith("upgrades populated")
+    )
+      continue;
+    await applyMigration(file);
   }
 });
+async function applyMigration(file: string) {
+  // D1 exec splits lines; individual prepared statements preserve trigger bodies.
+  const sql = readFileSync(
+    new URL("../migrations/" + file, import.meta.url),
+    "utf8",
+  );
+  const triggers = sql.match(/CREATE TRIGGER[\s\S]*?END;/g) ?? [];
+  const plain = sql
+    .replace(/--[^\n]*/g, "")
+    .replace(/CREATE TRIGGER[\s\S]*?END;/g, "");
+  const statements = [
+    ...plain
+      .split(";")
+      .map((s) => s.trim())
+      .filter(Boolean),
+    ...triggers,
+  ].map((sql) => database.prepare(sql));
+  for (let i = 0; i < statements.length; i += 80)
+    await database.batch(statements.slice(i, i + 80));
+}
 describe("private API and validation", () => {
   it("protects every private route, including unknown routes", async () => {
     for (const route of [
@@ -366,7 +385,7 @@ describe("cycle planner and shopping", () => {
     const updated = await get<Cycle>("/shopping/current");
     const requirements = new Map<string, number>();
     for (const p of changed.filter((p) => p.status === "planned"))
-      for (const i of p.recipe.items)
+      for (const i of managedItems(p.recipe))
         requirements.set(
           i.ingredientId,
           (requirements.get(i.ingredientId) ?? 0) + i.amount,
@@ -424,7 +443,7 @@ describe("meal completion, concurrency and snapshots", () => {
   }
   it("uses actual grams, completes once, and keeps historical data immutable", async () => {
     const p = await ready();
-    const items = p.recipe.items.map((i) => ({
+    const items = managedItems(p.recipe).map((i) => ({
       ...i,
       amount: i.ingredientId === "rice" ? 100 : i.amount,
     }));
@@ -484,7 +503,7 @@ describe("meal completion, concurrency and snapshots", () => {
     const response = await request("/plans/" + p.id + "/complete", {
       version: p.version,
       idempotencyKey: "insufficient-key",
-      items: p.recipe.items,
+      items: managedItems(p.recipe),
     });
     expect(response.status).toBe(409);
     expect(await get("/meal-logs")).toEqual([]);
@@ -502,7 +521,7 @@ describe("meal completion, concurrency and snapshots", () => {
     const body = {
       version: p.version,
       idempotencyKey: "concurrent-same-key",
-      items: p.recipe.items,
+      items: managedItems(p.recipe),
     };
     const responses = await Promise.all([
       request("/plans/" + p.id + "/complete", body),
@@ -563,7 +582,7 @@ describe("meal completion, concurrency and snapshots", () => {
         request("/plans/" + p.id + "/complete", {
           version: p.version,
           idempotencyKey,
-          items: p.recipe.items,
+          items: managedItems(p.recipe),
         }),
       ),
     );
@@ -609,5 +628,409 @@ describe("meal completion, concurrency and snapshots", () => {
     expect(changed.confirmed.kcal).toBe(223);
     expect(changed.projected.kcal).toBe(0);
     expect(changed.unknown).toContain("lunch");
+  });
+});
+
+describe("pantry classification and recipe detail acceptance", () => {
+  const exempt = ["oil", "soy", "miso", "sugar", "curry"];
+  it("shows names, canonical amounts and specific steps for every one of the 30 recipes", async () => {
+    const catalog = await get<Plan["recipe"][]>("/recipes"),
+      ingredients = await loadIngredients(database),
+      stocks = await get<Stock[]>("/inventory");
+    expect(catalog).toHaveLength(30);
+    for (const recipe of catalog) {
+      const steps = JSON.parse(recipe.instructions_json).join("\n");
+      expect(steps).not.toContain("{{");
+      expect(steps).not.toContain("主材料");
+      for (const item of recipe.items)
+        expect(steps).toContain(`${item.name} ${item.amount}${item.unit}`);
+      if (
+        recipe.id.startsWith("chicken") ||
+        recipe.id.startsWith("pork") ||
+        recipe.id.startsWith("salmon")
+      ) {
+        expect(steps).not.toContain("木綿豆腐");
+        expect(steps).not.toContain("鶏卵");
+      }
+      expect(steps).toContain("75℃");
+      expect(steps).toContain("1分以上");
+      expect(recipe.total_minutes).toBeLessThanOrEqual(30);
+      const html = renderToStaticMarkup(
+        createElement(RecipeDetails, { recipe, ingredients, stocks }),
+      );
+      expect(html).toContain("在庫管理する食材");
+      expect(html).toContain("調味料（在庫登録不要）");
+      for (const item of recipe.items) {
+        expect(html).toContain(item.name);
+        expect(html).toContain(`${item.amount}${item.unit}`);
+      }
+      const condiments = html
+        .split("調味料（在庫登録不要）")[1]
+        .split("作り方")[0];
+      expect(condiments).not.toContain("単独の不足");
+    }
+    await database
+      .prepare(
+        "UPDATE recipe_ingredients SET amount=400 WHERE recipe_id='chicken-ginger' AND ingredient_id='rice'",
+      )
+      .run();
+    const updated = (await get<Plan["recipe"][]>("/recipes")).find(
+      (r) => r.id === "chicken-ginger",
+    )!;
+    expect(updated.instructions_json).toContain("ご飯（炊飯済み） 400g");
+    expect(updated.instructions_json).not.toContain("350g");
+  });
+  it("plans and completes with zero condiment stocks, snapshots nutrition and corrects/retries without consuming condiments", async () => {
+    const day = new Date(tokyoDate() + "T00:00:00Z").getUTCDay(),
+      s = await get<Settings>("/settings");
+    await request(
+      "/settings",
+      { ...s, shoppingDays: [(day + 3) % 7, (day + 6) % 7] },
+      "PUT",
+    );
+    await fill();
+    const p = (await generation(false))[0],
+      ingredients = await loadIngredients(database);
+    const body = {
+      version: p.version,
+      idempotencyKey: "pantry-completion-key",
+      items: managedItems(p.recipe),
+    };
+    const log = await post<{
+      id: string;
+      total_kcal: number;
+      recipe_snapshot: string;
+    }>("/plans/" + p.id + "/complete", body);
+    expect(log.total_kcal).toBe(p.recipe.kcal);
+    expect(
+      log.total_kcal - nutrition(body.items, ingredients).kcal,
+    ).toBeGreaterThan(130);
+    expect(await post("/plans/" + p.id + "/complete", body)).toEqual(log);
+    const detail = await get<{
+      items: { ingredient_id: string; amount: number; amount_source: string }[];
+    }>("/meal-logs/" + log.id);
+    for (const item of p.recipe.items.filter((i) => i.inventory_exempt))
+      expect(
+        detail.items.find((i) => i.ingredient_id === item.ingredientId),
+      ).toMatchObject({ amount: item.amount, amount_source: "recipe_default" });
+    expect(
+      await database
+        .prepare(
+          "SELECT COUNT(*) AS n FROM inventory_movements WHERE ingredient_id IN ('oil','soy','miso','sugar','curry')",
+        )
+        .first<{ n: number }>(),
+    ).toEqual({ n: 0 });
+    const rice = (await get<Stock[]>("/inventory")).find(
+      (i) => i.id === "rice",
+    )!.quantity;
+    await database
+      .prepare(
+        "UPDATE recipe_ingredients SET amount=30 WHERE recipe_id=? AND ingredient_id='oil'",
+      )
+      .bind(p.recipe.id)
+      .run();
+    await database
+      .prepare("UPDATE ingredients SET kcal_per_100=1 WHERE id='oil'")
+      .run();
+    const correction = {
+      version: 0,
+      idempotencyKey: "pantry-correction-key",
+      items: body.items.map((i) => ({
+        ...i,
+        amount: i.ingredientId === "rice" ? i.amount - 50 : i.amount,
+      })),
+    };
+    const corrected = await post<{
+      items_snapshot: string;
+      total_kcal: number;
+    }>("/meal-logs/" + log.id + "/correct", correction);
+    expect(
+      JSON.parse(corrected.items_snapshot).find(
+        (i: RecipeItem) => i.ingredientId === "oil",
+      ),
+    ).toMatchObject({
+      amount: 15,
+      kcal_per_100: 887,
+      amountSource: "recipe_default",
+    });
+    expect(corrected.total_kcal).toBeCloseTo(log.total_kcal - 78, 1);
+    expect(await post("/meal-logs/" + log.id + "/correct", correction)).toEqual(
+      corrected,
+    );
+    expect(
+      (await get<Stock[]>("/inventory")).find((i) => i.id === "rice")!.quantity,
+    ).toBe(rice + 50);
+    expect(
+      (await get<{ recipe_snapshot: string }>("/meal-logs/" + log.id))
+        .recipe_snapshot,
+    ).toBe(log.recipe_snapshot);
+    expect(
+      await database
+        .prepare(
+          "SELECT COUNT(*) AS n FROM inventory_movements WHERE ingredient_id IN ('oil','soy','miso','sugar','curry')",
+        )
+        .first<{ n: number }>(),
+    ).toEqual({ n: 0 });
+  });
+  it("excludes condiments from shortages and purchase confirmation but keeps ginger managed and allergens active", async () => {
+    const ingredients = await loadIngredients(database),
+      stocks = await get<Stock[]>("/inventory");
+    expect(stocks).toHaveLength(13);
+    expect(stocks.map((i) => i.id)).toContain("ginger");
+    expect(stocks.some((i) => exempt.includes(i.id))).toBe(false);
+    const ps = await generation(),
+      cycle = await get<Cycle>("/shopping/current");
+    expect(cycle.items.every((i) => !exempt.includes(i.ingredient_id))).toBe(
+      true,
+    );
+    const body = {
+      version: cycle.version,
+      idempotencyKey: "pantry-purchase-key",
+      items: cycle.items.map((i) => ({
+        ingredientId: i.ingredient_id,
+        amount: i.proposed_amount,
+      })),
+    };
+    await post("/shopping/" + cycle.id + "/confirm", body);
+    await post("/shopping/" + cycle.id + "/confirm", body);
+    expect(
+      await database
+        .prepare(
+          "SELECT quantity FROM inventory_stocks WHERE ingredient_id='oil'",
+        )
+        .first(),
+    ).toEqual({ quantity: 0 });
+    const soyRecipe = (await get<Plan["recipe"][]>("/recipes")).find((r) =>
+      r.items.some((i) => i.ingredientId === "soy"),
+    )!;
+    const s = await get<Settings>("/settings");
+    expect(
+      eligible(soyRecipe, { ...s, allergies: ["小麦"] }, ingredients),
+    ).toBe(false);
+    const p = ps[0];
+    expect(
+      (
+        await request("/plans/" + p.id + "/complete", {
+          version: p.version,
+          idempotencyKey: "invalid-seasoning-key",
+          items: [
+            ...managedItems(p.recipe),
+            { ingredientId: "oil", amount: 15 },
+          ],
+        })
+      ).status,
+    ).toBe(422);
+    for (const id of exempt)
+      expect(
+        (
+          await request("/inventory/adjust", {
+            ingredientId: id,
+            delta: 1,
+            version: 0,
+            idempotencyKey: "no-pantry-update-" + id,
+          })
+        ).status,
+      ).toBe(422);
+    const newPs = await generation(false);
+    const first = newPs[0];
+    await post("/plans/" + first.id + "/skip", { version: first.version });
+    expect(
+      (await get<Cycle>("/shopping/current")).items.every(
+        (i) => !exempt.includes(i.ingredient_id),
+      ),
+    ).toBe(true);
+  });
+  it("upgrades populated 0001-0003 without altering stocks, movement history, meal snapshots or legacy shopping rows", async () => {
+    const oldIngredients = await loadIngredients(database);
+    const oldRecipe = await database
+      .prepare("SELECT * FROM recipes WHERE id='chicken-miso'")
+      .first<Plan["recipe"]>();
+    const oldItems = (
+      await database
+        .prepare(
+          "SELECT ingredient_id,amount FROM recipe_ingredients WHERE recipe_id='chicken-miso'",
+        )
+        .all<{ ingredient_id: string; amount: number }>()
+    ).results.map((i) => ({ ingredientId: i.ingredient_id, amount: i.amount }));
+    const total = nutrition(oldItems, oldIngredients),
+      snapshot = JSON.stringify({ ...oldRecipe, items: oldItems });
+    const legacyRequest = {
+      version: 0,
+      idempotencyKey: "legacy-complete-key",
+      items: oldItems,
+    };
+    const setup = [
+      database.prepare(
+        "INSERT INTO operations(idempotency_key,kind,payload,result_id) VALUES ('legacy-fill-key','adjust','{}','legacy-fill')",
+      ),
+    ];
+    for (const i of oldIngredients)
+      setup.push(
+        database
+          .prepare(
+            "INSERT INTO inventory_movements(id,ingredient_id,delta,reason,source_id,idempotency_key) VALUES (?, ?,10000,'manual_adjustment','legacy-fill','legacy-fill-key')",
+          )
+          .bind("legacy-fill-" + i.id, i.id),
+      );
+    setup.push(
+      database.prepare(
+        "INSERT INTO meal_plans(id,local_date,status) VALUES ('legacy-plan','2026-01-01','completed')",
+      ),
+      database.prepare(
+        "INSERT INTO meal_plan_dishes VALUES ('legacy-dish','legacy-plan','chicken-miso',1)",
+      ),
+      database
+        .prepare(
+          "INSERT INTO operations(idempotency_key,kind,payload,result_id) VALUES ('legacy-complete-key','complete',?,'legacy-log')",
+        )
+        .bind(JSON.stringify({ planId: "legacy-plan", ...legacyRequest })),
+      database
+        .prepare(
+          "INSERT INTO meal_logs(id,plan_id,total_kcal,total_protein_g,recipe_snapshot,idempotency_key) VALUES ('legacy-log','legacy-plan',?,?,?,'legacy-complete-key')",
+        )
+        .bind(total.kcal, total.protein, snapshot),
+    );
+    for (const item of oldItems) {
+      const ing = oldIngredients.find((i) => i.id === item.ingredientId)!;
+      setup.push(
+        database
+          .prepare(
+            "INSERT INTO meal_log_items VALUES (?,'legacy-log',?,?,?,?,?,?,?,?,?)",
+          )
+          .bind(
+            "legacy-item-" + ing.id,
+            ing.id,
+            ing.name,
+            item.amount,
+            ing.unit,
+            (item.amount * ing.kcal_per_100) / 100,
+            (item.amount * ing.protein_per_100) / 100,
+            ing.source,
+            ing.food_code,
+            ing.state,
+          ),
+        database
+          .prepare(
+            "INSERT INTO inventory_movements(id,ingredient_id,delta,reason,source_id,idempotency_key) VALUES (?, ?,?,'meal_consumption','legacy-log','legacy-complete-key')",
+          )
+          .bind("legacy-eaten-" + ing.id, ing.id, -item.amount),
+      );
+    }
+    setup.push(
+      database
+        .prepare(
+          "INSERT INTO shopping_cycles(id,starts_on,ends_on,shopping_on,status) VALUES ('legacy-cycle',?,?,?,'review')",
+        )
+        .bind(tokyoDate(), addDays(tokyoDate(), 3), tokyoDate()),
+      database.prepare(
+        "INSERT INTO shopping_items VALUES ('legacy-shop-oil','legacy-cycle','oil',45,45,NULL,'g','review')",
+      ),
+    );
+    setup.push(
+      database.prepare(
+        "INSERT INTO operations(idempotency_key,kind,payload,result_id) VALUES ('legacy-previous-correction','correction','{}','legacy-correction')",
+      ),
+      database
+        .prepare(
+          "INSERT INTO meal_log_corrections(id,log_id,version,items_snapshot,total_kcal,total_protein_g,idempotency_key) VALUES ('legacy-correction','legacy-log',1,?,?,?,'legacy-previous-correction')",
+        )
+        .bind(JSON.stringify(oldItems), total.kcal, total.protein),
+    );
+    await database.batch(setup);
+    const tables = [
+      "inventory_stocks",
+      "inventory_movements",
+      "meal_logs",
+      "meal_log_items",
+      "meal_log_corrections",
+      "meal_plans",
+      "meal_plan_dishes",
+      "operations",
+      "shopping_cycles",
+      "shopping_items",
+      "recipe_ingredients",
+      "app_settings",
+    ];
+    const before: Record<string, Record<string, unknown>[]> = {};
+    for (const table of tables)
+      before[table] = (
+        await database
+          .prepare("SELECT * FROM " + table + " ORDER BY rowid")
+          .all<Record<string, unknown>>()
+      ).results;
+    await applyMigration("0004_pantry_recipe_details.sql");
+    for (const table of tables) {
+      const after = (
+        await database
+          .prepare("SELECT * FROM " + table + " ORDER BY rowid")
+          .all<Record<string, unknown>>()
+      ).results;
+      expect(after).toHaveLength(before[table].length);
+      after.forEach((row, index) =>
+        expect(row).toMatchObject(before[table][index]),
+      );
+    }
+    expect((await get<Cycle>("/shopping/current")).items).toEqual([]);
+    expect((await get<Stock[]>("/inventory")).some((i) => i.id === "oil")).toBe(
+      false,
+    );
+    expect(
+      await post("/plans/legacy-plan/complete", legacyRequest),
+    ).toMatchObject(before.meal_logs[0]);
+    expect(
+      (
+        await database
+          .prepare("SELECT * FROM inventory_movements ORDER BY rowid")
+          .all()
+      ).results,
+    ).toEqual(before.inventory_movements);
+    const legacyCorrection = {
+      version: 1,
+      idempotencyKey: "legacy-correction-key",
+      items: oldItems
+        .filter((i) => !exempt.includes(i.ingredientId))
+        .map((i) => ({
+          ...i,
+          amount: i.ingredientId === "rice" ? 100 : i.amount,
+        })),
+    };
+    const oilBefore = await database
+      .prepare("SELECT * FROM inventory_stocks WHERE ingredient_id='oil'")
+      .first();
+    await post("/meal-logs/legacy-log/correct", legacyCorrection);
+    await post("/meal-logs/legacy-log/correct", legacyCorrection);
+    expect(
+      await database
+        .prepare("SELECT * FROM inventory_stocks WHERE ingredient_id='oil'")
+        .first(),
+    ).toEqual(oilBefore);
+    expect(
+      (await get<{ recipe_snapshot: string }>("/meal-logs/legacy-log"))
+        .recipe_snapshot,
+    ).toBe(snapshot);
+    await post("/shopping/legacy-cycle/confirm", {
+      version: 1,
+      idempotencyKey: "legacy-empty-purchase",
+      items: [],
+    });
+    expect(
+      await database
+        .prepare("SELECT * FROM shopping_items WHERE id='legacy-shop-oil'")
+        .first(),
+    ).toMatchObject(before.shopping_items[0]);
+    expect(
+      await database
+        .prepare(
+          "SELECT quantity FROM inventory_stocks WHERE ingredient_id='oil'",
+        )
+        .first(),
+    ).toEqual({ quantity: 10000 - 15 });
+    await expect(
+      database
+        .prepare(
+          "INSERT INTO inventory_movements(id,ingredient_id,delta,reason,source_id,idempotency_key) VALUES ('blocked-pantry','oil',1,'manual_adjustment','test','legacy-fill-key')",
+        )
+        .run(),
+    ).rejects.toThrow();
   });
 });

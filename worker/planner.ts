@@ -78,7 +78,7 @@ export function allocate(
   stock: Map<string, number>,
   deficits: Map<string, number>,
 ) {
-  for (const item of recipe.items) {
+  for (const item of recipe.items.filter((i) => !i.inventory_exempt)) {
     const available = stock.get(item.ingredientId) ?? 0;
     const missing = Math.max(0, item.amount - available);
     if (missing)
@@ -98,12 +98,13 @@ export function chooseRecipe(
 ): Recipe {
   const candidates = recipes
     .map((recipe) => {
-      const missing = recipe.items.reduce(
+      const managedItems = recipe.items.filter((i) => !i.inventory_exempt);
+      const missing = managedItems.reduce(
         (sum, i) =>
           sum + Math.max(0, i.amount - (stock.get(i.ingredientId) ?? 0)),
         0,
       );
-      const missingKinds = recipe.items.filter(
+      const missingKinds = managedItems.filter(
         (i) => i.amount > (stock.get(i.ingredientId) ?? 0),
       ).length;
       const score =

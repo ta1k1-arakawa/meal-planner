@@ -2,6 +2,8 @@ import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type {
   Stock,
+  Ingredient,
+  Recipe,
   Plan,
   Cycle,
   MealLog,
@@ -9,6 +11,7 @@ import type {
   NutritionSummary,
 } from "../worker/contracts";
 import "./style.css";
+import { RecipeDetails } from "./RecipeDetails";
 type Screen = "今日" | "献立" | "買い物" | "在庫" | "記録" | "設定";
 async function api<T>(
   path: string,
@@ -39,6 +42,8 @@ function App() {
   const [screen, setScreen] = useState<Screen>("今日"),
     [stocks, setStocks] = useState<Stock[]>([]),
     [plans, setPlans] = useState<Plan[]>([]),
+    [ingredients, setIngredients] = useState<Ingredient[]>([]),
+    [catalog, setCatalog] = useState<Recipe[]>([]),
     [cycle, setCycle] = useState<Cycle | null>(null),
     [logs, setLogs] = useState<MealLog[]>([]),
     [settings, setSettings] = useState<Settings | null>(null);
@@ -70,15 +75,19 @@ function App() {
     return key;
   }
   async function reload() {
-    const [st, pl, sh, lo, se, to] = await Promise.all([
+    const [st, pl, sh, lo, se, to, ing, recipes] = await Promise.all([
       api<Stock[]>("/inventory"),
       api<Plan[]>("/plans"),
       api<Cycle | null>("/shopping/current"),
       api<MealLog[]>("/meal-logs"),
       api<Settings>("/settings"),
       api<NonNullable<typeof today>>("/today"),
+      api<Ingredient[]>("/ingredients"),
+      api<Recipe[]>("/recipes"),
     ]);
     setStocks(st);
+    setIngredients(ing);
+    setCatalog(recipes);
     setPlans(pl);
     setCycle(sh);
     setLogs(lo);
@@ -123,7 +132,11 @@ function App() {
   function reviewPlan(p: Plan) {
     setReview(p);
     setAmounts(
-      Object.fromEntries(p.recipe.items.map((i) => [i.ingredientId, i.amount])),
+      Object.fromEntries(
+        p.recipe.items
+          .filter((i) => !i.inventory_exempt)
+          .map((i) => [i.ingredientId, i.amount]),
+      ),
     );
     setPending(null);
   }
@@ -158,33 +171,11 @@ function App() {
           <summary>
             {completedLog ? "計画時の食材・作り方を見る" : "食材・作り方を見る"}
           </summary>
-          <ul>
-            {recipe.items.map((i) => {
-              const stock = stocks.find((s) => s.id === i.ingredientId);
-              return (
-                <li key={i.ingredientId}>
-                  {stock?.name ?? i.ingredientId} {i.amount}
-                  {stock?.unit}{" "}
-                  <small>
-                    在庫 {stock?.quantity ?? 0}
-                    {stock?.unit} / 単独の不足{" "}
-                    {Math.max(0, i.amount - (stock?.quantity ?? 0))}
-                    {stock?.unit}
-                  </small>
-                </li>
-              );
-            })}
-          </ul>
-          <ol>
-            {(JSON.parse(recipe.instructions_json) as string[]).map(
-              (step, i) => (
-                <li key={i}>{step}</li>
-              ),
-            )}
-          </ol>
-          <p className="muted">
-            栄養は食品成分表に基づく概算。ご飯は炊飯済みの重量です。
-          </p>
+          <RecipeDetails
+            recipe={recipe}
+            ingredients={ingredients}
+            stocks={stocks}
+          />
         </details>
         {p.status === "planned" && (
           <div className="actions">
@@ -396,6 +387,21 @@ function App() {
             ) : (
               <p className="empty">献立を生成して始めましょう。</p>
             )}
+            <h2>レシピ一覧（{catalog.length}件）</h2>
+            {catalog.map((recipe) => (
+              <details key={recipe.id} className="card">
+                <summary>{recipe.title}</summary>
+                <p className="metrics">
+                  約{number(recipe.kcal)} kcal · たんぱく質{" "}
+                  {number(recipe.protein)} g · {recipe.total_minutes}分
+                </p>
+                <RecipeDetails
+                  recipe={recipe}
+                  ingredients={ingredients}
+                  stocks={stocks}
+                />
+              </details>
+            ))}
           </>
         )}
         {review && (
@@ -423,28 +429,43 @@ function App() {
                 }, "食事を記録し、使用分の在庫を消費しました");
               }}
             >
-              {review.recipe.items.map((i) => {
-                const st = stocks.find((s) => s.id === i.ingredientId);
-                return (
-                  <label key={i.ingredientId}>
-                    {st?.name}（{st?.unit}） · 在庫 {st?.quantity}
-                    <input
-                      type="number"
-                      min="0"
-                      max="1000000"
-                      step="1"
-                      required
-                      value={amounts[i.ingredientId]}
-                      onChange={(e) =>
-                        setAmounts({
-                          ...amounts,
-                          [i.ingredientId]: Number(e.target.value),
-                        })
-                      }
-                    />
-                  </label>
-                );
-              })}
+              {review.recipe.items
+                .filter((i) => !i.inventory_exempt)
+                .map((i) => {
+                  const st = stocks.find((s) => s.id === i.ingredientId);
+                  return (
+                    <label key={i.ingredientId}>
+                      {st?.name}（{st?.unit}） · 在庫 {st?.quantity}
+                      <input
+                        type="number"
+                        min="0"
+                        max="1000000"
+                        step="1"
+                        required
+                        value={amounts[i.ingredientId]}
+                        onChange={(e) =>
+                          setAmounts({
+                            ...amounts,
+                            [i.ingredientId]: Number(e.target.value),
+                          })
+                        }
+                      />
+                    </label>
+                  );
+                })}
+              <p className="muted">
+                調味料は下記のレシピ既定量を栄養に自動計上し、在庫は消費しません。
+              </p>
+              <ul>
+                {review.recipe.items
+                  .filter((i) => i.inventory_exempt)
+                  .map((i) => (
+                    <li key={i.ingredientId}>
+                      {i.name} {i.amount}
+                      {i.unit}（既定量）
+                    </li>
+                  ))}
+              </ul>
               <div className="actions">
                 <button disabled={busy}>確認して食事完了</button>
                 <button

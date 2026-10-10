@@ -22,6 +22,7 @@ const ingredients: Ingredient[] = [
     allergens_json: "[]",
     display_unit: null,
     grams_per_display_unit: null,
+    inventory_exempt: 0,
   },
 ];
 const settings: Settings = {
@@ -43,7 +44,14 @@ const recipe: Recipe = {
   equipment_json: '["フライパン"]',
   instructions_json: "[]",
   preference_weight: 0,
-  items: [{ ingredientId: "rice", amount: 350 }],
+  items: [
+    {
+      ...ingredients[0],
+      ingredientId: "rice",
+      amount: 350,
+      inventory_exempt: false,
+    },
+  ],
   kcal: 546,
   protein: 8.75,
 };
@@ -99,5 +107,34 @@ describe("deterministic planner rules", () => {
     expect(() =>
       nutrition([{ ingredientId: "unknown", amount: 100 }], ingredients),
     ).toThrow("未知の食材");
+  });
+});
+
+describe("pantry is nutrition, not virtual inventory", () => {
+  it("keeps oil energy while excluding its absent stock from allocation and feasibility", () => {
+    const oil: Ingredient = {
+      ...ingredients[0],
+      id: "oil",
+      name: "油（テスト用）",
+      kcal_per_100: 887,
+      protein_per_100: 0,
+      inventory_exempt: 1,
+    };
+    const items = [
+      ...recipe.items,
+      { ...oil, ingredientId: "oil", amount: 15, inventory_exempt: true },
+    ];
+    const dish = {
+      ...recipe,
+      items,
+      ...nutrition(items, [...ingredients, oil]),
+    };
+    expect(dish.kcal).toBe(679.1);
+    const stocks = new Map([["rice", 350]]),
+      missing = new Map<string, number>();
+    expect(chooseRecipe([dish], stocks, [], settings, false)).toEqual(dish);
+    allocate(dish, stocks, missing);
+    expect(missing.size).toBe(0);
+    expect(stocks.has("oil")).toBe(false);
   });
 });
