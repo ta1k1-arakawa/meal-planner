@@ -1,0 +1,50 @@
+# Dinner Planner — Product / Technical Specification v1.1
+
+## Scope and operating assumptions
+Personal Japanese mobile-first PWA. Automatically schedule dinners only. Shopping twice per week on configurable weekdays. One-person portions. Up to 30 minutes including prep. Run without a personal PC via Cloudflare Workers, D1 and static app deployment. Require access control. Target minimal ongoing cost; external vision AI may incur costs.
+
+## Nutrition and default non-dinner behavior
+Initial daily target: 2,800 kcal / 110g protein (estimate requiring weight-trend adjustment). Initial dinner target: 950 kcal / 40g protein; preferred 850–1050 kcal, >=35g protein. Breakfast preset is `none`; another optional preset is `two_mochi`, with edible grams and nutritional values configurable. Nighttime protein shake preset is one serving; brand/amount/water-or-milk/nutrients configurable. Day-specific override allowed. Lunch/snacks entered manually if desired. A preset is a forecast, NOT evidence it was consumed. In daily view show separate `confirmed`, `projected`, `unknown` values. If lunch is unrecorded, do NOT present daily sum as complete. Offer optional weight log and calculate 7-day trend; energy goal is user-editable.
+
+## Inventory and measurements
+One aggregate stock row per ingredient + unit if applicable, without expiration metadata. Canonical internal ingredient amounts in g for food (and ml for liquids where appropriate). Pack count/pieces may be retained as display units and converted using editable conversion coefficients; do not claim exact mass. Track an append-only movement ledger (`purchase`, `meal_consumption`, `manual_adjustment`, `correction`) and current quantity as a maintained aggregate. Safe concurrent updates must enforce stock >= 0. No expiry sorting. Storage type is optional. User is responsible for food safety.
+
+## Recipe model
+Recipes have name, serving yield, total estimated prep/cooking time, equipment, numbered instructions, labels, tags and optional user preference weight. Recipe-ingredient lines contain canonical measured quantities, optional substitutions, raw/cooked state and food composition source identifier. Dinner can be a dish or combo of dish+rice+side. Nutrient calculation from food ingredient reference amounts; snapshots committed on completion. Seed a tested catalog of 30–50 realistic 30-min meals; expand later. Some ingredient values are necessarily approximate; mark them.
+
+## Planning lifecycle
+`draft` -> `planned` -> `completed` or `skipped` (replanning can replace only open days). At shopping day, generate dinners until the day before the following shopping day using current stocks plus proposed purchases. Compute cumulative requirement and deficits for the shopping list. On non-shopping days, plan with stocks already in house unless explicitly allowing a purchase. Use virtual inventory reservations in chronological order. Avoid repeated recipes and penalize large leftover purchases. Ensure feasible portion scaling within 30 minutes. Never decrement actual stock for planned consumption. If a dinner changes, recompute open-day reservations and shopping shortfalls.
+
+## Shopping lifecycle
+`shopping_cycles`: date range, scheduled shopping date, status. `shopping_items`: planned need, proposed purchase, actual purchase, unit, review/confirmed status. On purchase confirmation, perform atomic stock increase + movement writes. Use an idempotency token to avoid double additions. Some purchases can be omitted or quantity-edited. Do not assume photo-extracted amount has been purchased until confirmed.
+
+## Photo recognition
+Entry point: camera or library, multiple image types (goods, readable package labels, receipt). Server-side adapter interface for vision model to emit structured JSON with canonical name candidate, quantity, unit, raw text, estimated/confidence flags and unresolved items. No precise weights inferred from ambiguous objects alone. Match product to ingredients; require user review of all rows. Store recognition metadata, not raw images by default; ephemeral upload handling. Rate limit and size-limit requests, allow full manual fallback, maintain cost visibility. Confirm changes to inventory only via purchase confirmation or explicit stock addition; photo confirmation and shopping confirmation must not result in double addition.
+
+## Meal completion transaction
+Client allows review and editing of actually used grams (including rice and sides). API validates version, auth, nonnegative amounts, and sufficient stock. Single atomic batch: insert meal log with nutrient snapshot, insert detailed ingredient consumption lines, insert negative stock movements, decrement stocks, set plan completed, record idempotency key. Return newly committed meal log. Retry same key returns same result; a different key for already completed plan returns conflict. If lacking inventory, reject without writes and provide reconciliation UI. Corrections are audit logged and apply compensating movements transactionally. Skipping has no consumption and marks plan skipped.
+
+## Proposed domain schema (conceptual)
+- `ingredients(id,name,canonical_unit,nutrients_per_100,source,...)`
+- `recipes(id,title,servings,total_minutes,instructions_json,...)`; `recipe_ingredients(recipe_id,ingredient_id,amount,unit,...)`
+- `inventory_stocks(id,ingredient_id,quantity,unit,version,...)` with `UNIQUE(ingredient_id,unit)`; `inventory_movements(id,stock_id,delta,reason,source_id,idempotency_key,created_at)`
+- `meal_plans(id,local_date,status,version,...)`; `meal_plan_dishes(id,plan_id,recipe_id,servings,...)`
+- `meal_logs(id,plan_id,completed_at,total_kcal,total_protein_g,idempotency_key,...)`; `meal_log_items(id,log_id,ingredient_id,amount,unit,kcal,protein_g,...)`
+- `shopping_cycles(id,starts_on,ends_on,shopping_on,status,...)`; `shopping_items(id,cycle_id,ingredient_id,requested_amount,actual_amount,unit,status,...)`
+- `photo_imports(id,status,created_at,model,...)`; `photo_import_items(id,import_id,ingredient_candidate,amount,unit,estimate_flag,raw_label,...)`
+- `food_presets(id,kind,label,nutrients,quantity,enabled_by_default,...)`; `daily_food_entries(id,local_date,meal_type,preset_id,source,status,kcal,protein_g,...)`
+- `body_weight_logs(id,local_date,weight_kg,...)`; `app_settings(id,timezone,targets,shopping_days,max_minutes,preferences,...)`
+Exact SQL schema, FKs, nullability, indexes and migrations to be designed and tested by implementation agent. For integrity use explicit keys, UNIQUE(plan_id) on completed logs and compare-and-swap/version guards for plan changes.
+
+## Initial API and UX
+Screens: Today (dinner + ingredients + preparation + kcal/protein), Plans (calendar & replace), Shopping (list & confirm), Inventory (manual/photo addition), History (completed meals & daily estimates), Settings (goals, days, presets). REST endpoints enumerated in AGENTS.md. Japanese local dates; timestamps stored UTC. Privacy by default: auth protected, secrets only on backend, no public inventory or images.
+
+## MVP acceptance and milestone order
+1. Setup/auth/migrations and tests; seed recipes/nutrition.
+2. Inventory + atomic movement logic; unit conversion.
+3. Dinner completion, skip, correction, idempotency and history.
+4. Cycle-aware menu optimizer and shopping shortfall calculator.
+5. Nutrition presets & daily summary distinguishing projected/confirmed.
+6. Vision adapter with confirm-before-save and manual fallback.
+7. PWA UX, deploy, errors and documentation.
+No external vision API is required to complete basic planning flows; stub tests must be explicitly labeled stubs.
