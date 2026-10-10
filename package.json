@@ -1,0 +1,39 @@
+{
+  "name": "meal-planner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:api": "wrangler dev",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "db:migrate": "wrangler d1 migrations apply meal-planner --local",
+    "db:seed": "wrangler d1 execute meal-planner --local --file migrations/0002_seed.sql",
+    "deploy": "npm run build && wrangler deploy"
+  },
+  "dependencies": {
+    "hono": "^4.12.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zod": "^4.3.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261006.1",
+    "@eslint/js": "^9.39.0",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "eslint": "^9.39.0",
+    "miniflare": "^4.20250901.0",
+    "prettier": "^3.9.9",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "^8.46.0",
+    "vite": "^7.1.0",
+    "vitest": "^3.2.0",
+    "wrangler": "^4.40.0"
+  }
+}
