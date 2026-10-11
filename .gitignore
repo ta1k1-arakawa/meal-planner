@@ -6,3 +6,5 @@ dist/
 !.env.example
 .dev.vars
 coverage/
+.release-wrangler.json
+.release-backup/

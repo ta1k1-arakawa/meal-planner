@@ -1,0 +1,75 @@
+name: Deploy production (manual)
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never interrupt a backup/migration/deployment with another release.
+concurrency:
+  group: meal-planner-production
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    env:
+      CI: "true"
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-dist
+          path: dist/
+      - name: Configure existing production resources
+        run: python3 scripts/release-config.py
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ vars.CLOUDFLARE_D1_DATABASE_ID }}
+          CLOUDFLARE_WORKER_NAME: ${{ vars.CLOUDFLARE_WORKER_NAME }}
+      - name: Export and encrypt D1 before any mutation
+        run: bash scripts/release.sh backup
+        timeout-minutes: 15
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          D1_BACKUP_KEY: ${{ secrets.D1_BACKUP_KEY }}
+      - name: Persist encrypted backup (required before migration)
+        id: backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: d1-backup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release-backup/d1.sql.enc
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Apply only pending migrations
+        run: bash scripts/release.sh migrate
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          BACKUP_ARTIFACT_ID: ${{ steps.backup.outputs.artifact-id }}
+      - name: Deploy verified Worker and assets
+        run: bash scripts/release.sh deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Remove runner backup files
+        if: always()
+        run: rm -rf .release-backup .release-wrangler.json
