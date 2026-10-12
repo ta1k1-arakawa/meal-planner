@@ -199,7 +199,7 @@ function App() {
                 )
               }
             >
-              別の献立
+              別の料理に変更
             </button>
             <button
               className="secondary"
@@ -212,6 +212,21 @@ function App() {
               }
             >
               スキップ
+            </button>
+          </div>
+        )}
+        {p.status === "skipped" && p.local_date >= (today?.date ?? "") && (
+          <div className="actions">
+            <button
+              disabled={busy}
+              onClick={() =>
+                run(
+                  () => api("/plans/" + p.id + "/unskip", { version: p.version }),
+                  "スキップを取り消しました。未確定の買い物リストも更新しました。確定済みの買い物リストは変更されないため、必要な食材を確認してください。",
+                )
+              }
+            >
+              スキップを取り消す
             </button>
           </div>
         )}
@@ -756,6 +771,10 @@ function SettingsForm({
         ))}
         <fieldset>
           <legend>買い物曜日（2つ選択）</legend>
+          <p className="muted">
+            週2回のまとめ買い向けです。次の買い物日の前日までの献立と不足食材を計算します。
+            水・木に買い物できない場合は、例として火・土を選べます。
+          </p>
           <div className="weekdays">
             {[0, 1, 2, 3, 4, 5, 6].map((d) => (
               <label className="check" key={d}>

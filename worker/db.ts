@@ -365,6 +365,52 @@ export async function reconcileShopping(
   }
   return statements;
 }
+/**
+ * Restore a skipped dinner without selecting a different recipe.
+ * Keep historical completed meals immutable, and recompute all pending shopping
+ * reviews atomically with the status change. Confirmed purchases stay immutable.
+ */
+export async function unskip(
+  db: D1Database,
+  id: string,
+  version: number,
+) {
+  const existingPlans = await plans(db);
+  const target = existingPlans.find((p) => p.id === id);
+  if (!target || target.status !== "skipped" || target.version !== version)
+    throw new DomainError(
+      "PLAN_CONFLICT",
+      "この献立は変更済みか、スキップされていません。再読込してください。",
+      409,
+    );
+  if (target.local_date < tokyoDate())
+    throw new DomainError(
+      "PAST_DATE",
+      "過去のスキップは取り消せません。",
+      422,
+    );
+  const projectedPlans = existingPlans.map((p) =>
+    p.id === id ? { ...p, status: "planned" as const, version: p.version + 1 } : p,
+  );
+  const projections = await reconcileShopping(db, { projectedPlans });
+  await atomic(db, [
+    ...projections,
+    guard(
+      db,
+      "EXISTS(SELECT 1 FROM meal_plans WHERE id=? AND version=? AND status='skipped' AND local_date>=?)",
+      id,
+      version,
+      tokyoDate(),
+    ),
+    stmt(
+      db,
+      "UPDATE meal_plans SET status='planned', version=version+1 WHERE id=?",
+      id,
+    ),
+  ]);
+  return { ok: true };
+}
+
 export async function generate(
   db: D1Database,
   start: string,

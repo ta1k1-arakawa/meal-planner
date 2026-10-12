@@ -396,6 +396,59 @@ describe("cycle planner and shopping", () => {
           ?.proposed_amount,
       ).toBe(amount);
   });
+  it("restores skipped dinners without changing their recipe and recalculates the shopping review", async () => {
+    const date = tokyoDate();
+    const day = new Date(date + "T00:00:00Z").getUTCDay();
+    const s = await get<Settings>("/settings");
+    await request(
+      "/settings",
+      { ...s, shoppingDays: [day, (day + 4) % 7] },
+      "PUT",
+    );
+    const generated = await generation();
+    const first = generated[0];
+    const initial = await get<Cycle>("/shopping/current");
+    const rice = initial.items.find((i) => i.ingredient_id === "rice")!.proposed_amount;
+    const stockBefore = await get<Stock[]>("/inventory");
+
+    await post("/plans/" + first.id + "/skip", { version: first.version });
+    const skipped = (await get<Plan[]>("/plans")).find((p) => p.id === first.id)!;
+    expect(skipped.status).toBe("skipped");
+    const skippedCycle = await get<Cycle>("/shopping/current");
+    expect(skippedCycle.items.find((i) => i.ingredient_id === "rice")?.proposed_amount).toBe(rice - 350);
+
+    await post("/plans/" + first.id + "/unskip", { version: skipped.version });
+    const restored = (await get<Plan[]>("/plans")).find((p) => p.id === first.id)!;
+    expect(restored.status).toBe("planned");
+    expect(restored.recipe.id).toBe(first.recipe.id);
+    expect(restored.version).toBe(skipped.version + 1);
+    const restoredCycle = await get<Cycle>("/shopping/current");
+    expect(restoredCycle.items.find((i) => i.ingredient_id === "rice")?.proposed_amount).toBe(rice);
+    expect(await get<Stock[]>("/inventory")).toEqual(stockBefore);
+
+    expect(
+      (await request("/plans/" + first.id + "/unskip", { version: skipped.version })).status,
+    ).toBe(409);
+    await post("/plans/" + first.id + "/regenerate", {
+      version: restored.version,
+      allowPurchase: true,
+    });
+    const changed = (await get<Plan[]>("/plans")).find((p) => p.id === first.id)!;
+    expect(changed.recipe.id).not.toBe(first.recipe.id);
+  });
+  it("does not allow restoring a skipped dinner in the past", async () => {
+    const generated = await generation();
+    const first = generated[0];
+    await post("/plans/" + first.id + "/skip", { version: first.version });
+    await database
+      .prepare("UPDATE meal_plans SET local_date=? WHERE id=?")
+      .bind(addDays(tokyoDate(), -1), first.id)
+      .run();
+    const skipped = (await get<Plan[]>("/plans")).find((p) => p.id === first.id)!;
+    const r = await request("/plans/" + first.id + "/unskip", { version: skipped.version });
+    expect(r.status).toBe(422);
+    expect((await get<Plan[]>("/plans")).find((p) => p.id === first.id)?.status).toBe("skipped");
+  });
   it("uses stock-only planning on non-shopping days and reserves earlier plans", async () => {
     const date = tokyoDate(),
       day = new Date(date + "T00:00:00Z").getUTCDay(),

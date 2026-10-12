@@ -297,6 +297,10 @@ app.post("/api/plans/:id/skip", async (c) => {
   ]);
   return c.json({ ok: true });
 });
+app.post("/api/plans/:id/unskip", async (c) => {
+  const { version } = versionSchema.parse(await c.req.json());
+  return c.json(await db.unskip(c.env.DB, c.req.param("id"), version));
+});
 app.post("/api/plans/:id/complete", async (c) => {
   const body = completeSchema.parse(await c.req.json());
   const planId = c.req.param("id");
