@@ -1563,3 +1563,72 @@ describe("Issue #4 shopping schedule and candidate selection", () => {
     expect((await candidatePage(plan)).candidates).toEqual([]);
   });
 });
+
+it("rejects another plan changing between candidate validation and shopping reconciliation", async () => {
+  await atDate("2026-10-13");
+  const s = await get<Settings>("/settings");
+  await post("/settings", { ...s, shoppingDays: [2, 6] }, "PUT");
+  await generation();
+  const ps = await get<Plan[]>("/plans");
+  const target = ps[0],
+    other = ps[1];
+  const candidate = (await candidatePage(target)).candidates[0].recipe;
+  const stocks = await get<Stock[]>("/inventory");
+  let reads = 0;
+  env.DB = new Proxy(database, {
+    get(db, key) {
+      if (key === "prepare")
+        return (sql: string) => {
+          function wrap(statement: D1PreparedStatement): D1PreparedStatement {
+            return new Proxy(statement, {
+              get(stmt, method) {
+                if (method === "bind")
+                  return (...values: unknown[]) => wrap(stmt.bind(...values));
+                if (
+                  method === "all" &&
+                  sql === "SELECT * FROM meal_plans ORDER BY local_date"
+                )
+                  return async () => {
+                    if (++reads === 2)
+                      await database
+                        .prepare(
+                          "UPDATE meal_plans SET version=version+1 WHERE id=?",
+                        )
+                        .bind(other.id)
+                        .run();
+                    return stmt.all();
+                  };
+                const value = Reflect.get(stmt, method);
+                return typeof value === "function" ? value.bind(stmt) : value;
+              },
+            });
+          }
+          return wrap(db.prepare(sql));
+        };
+      const value = Reflect.get(db, key);
+      return typeof value === "function" ? value.bind(db) : value;
+    },
+  });
+  try {
+    expect(
+      (
+        await request("/plans/" + target.id + "/regenerate", {
+          version: target.version,
+          recipeId: candidate.id,
+          allowPurchase: true,
+        })
+      ).status,
+    ).toBe(409);
+  } finally {
+    env.DB = database;
+  }
+  expect(reads).toBe(2);
+  expect((await get<Plan[]>("/plans")).find((p) => p.id === target.id)).toEqual(
+    target,
+  );
+  expect(await get<Stock[]>("/inventory")).toEqual(stocks);
+  expect(
+    (await database.prepare("SELECT * FROM plan_recipe_rejections").all())
+      .results,
+  ).toEqual([]);
+});

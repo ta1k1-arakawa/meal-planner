@@ -598,6 +598,15 @@ export async function generate(
   const statements: D1PreparedStatement[] = [
     guard(db, "EXISTS(SELECT 1 FROM app_settings WHERE version=?)", s.version),
   ];
+  for (const c of reviewCycles)
+    statements.push(
+      guard(
+        db,
+        "EXISTS(SELECT 1 FROM shopping_cycles WHERE id=? AND version=? AND status='review' AND obsolete=0)",
+        c.id,
+        c.version,
+      ),
+    );
   // Snapshot guards prevent concurrent adjustments/completions/generation invalidating projections.
   for (const stock of stocks)
     statements.push(
@@ -817,7 +826,17 @@ async function candidateContext(
       allocate(p.recipe, available, deficits);
     return deficits.size === 0;
   });
-  return { config, target, ps, stocks, virtual, purchase, cycle, feasible };
+  return {
+    config,
+    target,
+    ps,
+    stocks,
+    virtual,
+    purchase,
+    cycle,
+    cycles,
+    feasible,
+  };
 }
 
 export async function recipeCandidates(
@@ -913,6 +932,23 @@ export async function selectRecipe(
       db,
       "EXISTS(SELECT 1 FROM app_settings WHERE version=?)",
       context.config.version,
+    ),
+    guard(db, "(SELECT COUNT(*) FROM meal_plans)=?", context.ps.length),
+    ...context.ps.map((p) =>
+      guard(
+        db,
+        "EXISTS(SELECT 1 FROM meal_plans WHERE id=? AND version=?)",
+        p.id,
+        p.version,
+      ),
+    ),
+    ...context.cycles.map((c) =>
+      guard(
+        db,
+        "EXISTS(SELECT 1 FROM shopping_cycles WHERE id=? AND version=? AND obsolete=0)",
+        c.id,
+        c.version,
+      ),
     ),
     ...context.stocks.map((s) =>
       guard(
