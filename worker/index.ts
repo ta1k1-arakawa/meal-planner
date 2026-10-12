@@ -8,13 +8,25 @@ import {
   purchaseSchema,
   generateSchema,
   versionSchema,
+  candidatesSchema,
+  selectRecipeSchema,
   settingsSchema,
   dateSchema,
+  type Cycle,
   type RecipeItem,
   type AmountItem,
   type NutritionSummary,
 } from "./contracts";
-import { DomainError, tokyoDate, addDays, nutrition } from "./planner";
+import {
+  DomainError,
+  tokyoDate,
+  addDays,
+  nutrition,
+  sameShoppingDays,
+  nextShoppingDate,
+  cycleEnd,
+  currentSchedule,
+} from "./planner";
 import * as db from "./db";
 import { actualItems, recipeItem } from "./recipe";
 export interface Env {
@@ -251,29 +263,27 @@ app.post("/api/plans/generate", async (c) => {
     );
   return c.json(await db.generate(c.env.DB, b.startDate, b.allowPurchase));
 });
-app.post("/api/plans/:id/regenerate", async (c) => {
-  const b = versionSchema
-    .extend({ allowPurchase: z.boolean().default(false) })
-    .parse(await c.req.json());
-  const plan = (await db.plans(c.env.DB)).find(
-    (p) => p.id === c.req.param("id"),
-  );
-  if (!plan) throw new DomainError("NOT_FOUND", "献立がありません", 404);
-  if (plan.version !== b.version || !["planned", "draft"].includes(plan.status))
-    throw new DomainError(
-      "PLAN_CONFLICT",
-      "献立は変更済みか完了しています",
-      409,
-    );
-  if (plan.local_date < tokyoDate())
-    throw new DomainError("PAST_DATE", "過去の献立は再生成できません", 422);
+app.post("/api/plans/:id/candidates", async (c) => {
+  const b = candidatesSchema.parse(await c.req.json());
   return c.json(
-    await db.generate(
+    await db.recipeCandidates(
       c.env.DB,
-      plan.local_date,
+      c.req.param("id"),
+      b.version,
       b.allowPurchase,
-      plan.recipe.id,
-      { id: plan.id, version: b.version },
+      b.exclude,
+    ),
+  );
+});
+app.post("/api/plans/:id/regenerate", async (c) => {
+  const b = selectRecipeSchema.parse(await c.req.json());
+  return c.json(
+    await db.selectRecipe(
+      c.env.DB,
+      c.req.param("id"),
+      b.version,
+      b.recipeId,
+      b.allowPurchase,
     ),
   );
 });
@@ -443,7 +453,7 @@ app.post("/api/shopping/:id/confirm", async (c) => {
   if (old) return c.json({ cycleId: old });
   const cycle = await db
     .stmt(c.env.DB, "SELECT * FROM shopping_cycles WHERE id=?", id)
-    .first<{ status: string; version: number }>();
+    .first<Cycle>();
   const retried = await db.replay(
     c.env.DB,
     b.idempotencyKey,
@@ -453,6 +463,13 @@ app.post("/api/shopping/:id/confirm", async (c) => {
   if (retried) return c.json({ cycleId: retried });
   if (!cycle)
     throw new DomainError("NOT_FOUND", "買い物リストがありません", 404);
+  const currentSettings = await db.settings(c.env.DB);
+  if (!currentSchedule(cycle, currentSettings.shoppingDays))
+    throw new DomainError(
+      "OBSOLETE_SHOPPING",
+      "旧曜日の買い物リストは確定できません。設定画面から作り直してください",
+      409,
+    );
   if (cycle.status !== "review" || cycle.version !== b.version)
     throw new DomainError(
       "SHOPPING_CONFLICT",
@@ -481,7 +498,12 @@ app.post("/api/shopping/:id/confirm", async (c) => {
     ...projections,
     db.guard(
       c.env.DB,
-      "EXISTS(SELECT 1 FROM shopping_cycles WHERE id=? AND version=? AND status='review')",
+      "EXISTS(SELECT 1 FROM app_settings WHERE version=?)",
+      currentSettings.version,
+    ),
+    db.guard(
+      c.env.DB,
+      "EXISTS(SELECT 1 FROM shopping_cycles WHERE id=? AND version=? AND status='review' AND obsolete=0)",
       id,
       b.version,
     ),
@@ -729,7 +751,57 @@ app.post("/api/meal-logs/:id/correct", async (c) => {
 app.get("/api/settings", async (c) => c.json(await db.settings(c.env.DB)));
 app.put("/api/settings", async (c) => {
   const s = settingsSchema.parse(await c.req.json());
+  const saved = await db.settings(c.env.DB);
+  const reviewCycles = await db.rows<Cycle>(
+    c.env.DB,
+    "SELECT * FROM shopping_cycles WHERE status='review'",
+  );
+  const changed = !sameShoppingDays(saved.shoppingDays, s.shoppingDays);
+  const stale = reviewCycles.filter(
+    (c) => !c.obsolete && !currentSchedule(c, s.shoppingDays),
+  );
+  if (
+    ((changed && reviewCycles.some((c) => !c.obsolete)) || stale.length) &&
+    !s.discardPendingShopping
+  )
+    throw new DomainError(
+      "SHOPPING_RESET_REQUIRED",
+      "旧曜日の未確定リストを破棄し、新しい曜日で不足量を再計算する確認が必要です。献立・在庫・確定済み購入・食事記録は保持します",
+      409,
+      { pendingLists: reviewCycles.filter((c) => !c.obsolete).length },
+    );
+  const reset = s.discardPendingShopping && (changed || stale.length > 0);
+  const obsoleteCycles = reset
+    ? reviewCycles.filter((c) => !c.obsolete).map((c) => c.id)
+    : [];
+  const start = nextShoppingDate(tokyoDate(), s.shoppingDays);
+  const alreadyConfirmed = await db
+    .stmt(
+      c.env.DB,
+      "SELECT id FROM shopping_cycles WHERE starts_on=? AND status='confirmed'",
+      start,
+    )
+    .first();
+  const newCycle =
+    reset && !alreadyConfirmed
+      ? {
+          id: crypto.randomUUID(),
+          starts_on: start,
+          ends_on: cycleEnd(start, s.shoppingDays),
+          shopping_on: start,
+          status: "review" as const,
+          version: 0,
+          obsolete: 0,
+          shopping_days_json: JSON.stringify([...s.shoppingDays].sort()),
+        }
+      : undefined;
+  const projections = await db.reconcileShopping(c.env.DB, {
+    settingsOverride: s,
+    obsoleteCycles,
+    newCycle,
+  });
   await db.atomic(c.env.DB, [
+    ...projections,
     db.guard(
       c.env.DB,
       "EXISTS(SELECT 1 FROM app_settings WHERE version=?)",

@@ -4,6 +4,7 @@ import type {
   Stock,
   Ingredient,
   Recipe,
+  RecipeCandidates,
   Plan,
   Cycle,
   MealLog,
@@ -12,6 +13,12 @@ import type {
 } from "../worker/contracts";
 import "./style.css";
 import { RecipeDetails } from "./RecipeDetails";
+import { RecipeCandidatePicker } from "./RecipeCandidatePicker";
+import {
+  nextShoppingDate,
+  cycleEnd,
+  sameShoppingDays,
+} from "../worker/planner";
 type Screen = "今日" | "献立" | "買い物" | "在庫" | "記録" | "設定";
 async function api<T>(
   path: string,
@@ -140,6 +147,27 @@ function App() {
     );
     setPending(null);
   }
+  const [candidatePlan, setCandidatePlan] = useState<Plan | null>(null);
+  const [candidatePage, setCandidatePage] = useState<RecipeCandidates | null>(
+    null,
+  );
+  const [seenCandidates, setSeenCandidates] = useState<string[]>([]);
+  async function openCandidates(p: Plan, exclude: string[] = []) {
+    const page = await api<RecipeCandidates>("/plans/" + p.id + "/candidates", {
+      version: p.version,
+      allowPurchase: purchase,
+      exclude,
+    });
+    setCandidatePlan(p);
+    setCandidatePage(page);
+    setSeenCandidates([...exclude, ...page.candidates.map((c) => c.recipe.id)]);
+  }
+  const nextBuy =
+    settings && today
+      ? nextShoppingDate(today.date, settings.shoppingDays)
+      : "";
+  const nextEnd =
+    settings && nextBuy ? cycleEnd(nextBuy, settings.shoppingDays) : "";
   const selected = stocks.find((s) => s.id === adjustIngredient);
   function recipeCard(p: Plan) {
     const completedLog = logs.find((l) => l.plan_id === p.id);
@@ -190,12 +218,9 @@ function App() {
               disabled={busy}
               onClick={() =>
                 run(
-                  () =>
-                    api("/plans/" + p.id + "/regenerate", {
-                      version: p.version,
-                      allowPurchase: purchase,
-                    }),
-                  "献立を変更しました。期間内の後続献立と不足量も更新しました",
+                  () => openCandidates(p),
+                  "候補を比較して選んでください",
+                  false,
                 )
               }
             >
@@ -221,7 +246,8 @@ function App() {
               disabled={busy}
               onClick={() =>
                 run(
-                  () => api("/plans/" + p.id + "/unskip", { version: p.version }),
+                  () =>
+                    api("/plans/" + p.id + "/unskip", { version: p.version }),
                   "スキップを取り消しました。未確定の買い物リストも更新しました。確定済みの買い物リストは変更されないため、必要な食材を確認してください。",
                 )
               }
@@ -291,6 +317,7 @@ function App() {
               onClick={() => {
                 setScreen(s);
                 setReview(null);
+                setCandidatePlan(null);
               }}
               aria-current={s === screen ? "page" : undefined}
             >
@@ -418,6 +445,31 @@ function App() {
               </details>
             ))}
           </>
+        )}
+        {candidatePlan && candidatePage && (
+          <RecipeCandidatePicker
+            plan={candidatePlan}
+            page={candidatePage}
+            busy={busy}
+            next={() =>
+              run(
+                () => openCandidates(candidatePlan, seenCandidates),
+                "表示済みを除いた候補です",
+                false,
+              )
+            }
+            cancel={() => setCandidatePlan(null)}
+            select={(recipeId) =>
+              run(async () => {
+                await api("/plans/" + candidatePlan.id + "/regenerate", {
+                  version: candidatePage.version,
+                  recipeId,
+                  allowPurchase: purchase,
+                });
+                setCandidatePlan(null);
+              }, "選んだ料理に変更し、未確定の買い物リストを再計算しました")
+            }
+          />
         )}
         {review && (
           <section className="card review" aria-label="食事完了の確認">
@@ -589,17 +641,58 @@ function App() {
         )}
         {screen === "買い物" && (
           <>
-            <h2>買い物リスト</h2>
+            <h2>次回のまとめ買い</h2>
+            <p>
+              予定：{nextBuy}（
+              {nextBuy &&
+                "日月火水木金土"[new Date(nextBuy + "T00:00:00Z").getUTCDay()]}
+              ） · {nextBuy}〜{nextEnd}
+            </p>
+            <button
+              disabled={busy}
+              onClick={() => {
+                if (
+                  window.confirm(
+                    "この期間の未完了献立を生成し、不足量を更新します。完了・スキップ済み、在庫、購入履歴は保持します。続けますか？",
+                  )
+                )
+                  run(
+                    () =>
+                      api("/plans/generate", {
+                        startDate: nextBuy,
+                        allowPurchase: true,
+                      }),
+                    "次回まとめ買い期間の献立と不足量を生成しました",
+                  );
+              }}
+            >
+              次回買い物の献立・リストを生成
+            </button>
+            <p className="muted">
+              火曜日は火〜金の4日分、土曜日は土〜月の3日分。予定を見ただけでは在庫に追加されません。
+            </p>
             {cycle ? (
               <section className="card">
                 <p>
-                  {cycle.starts_on} 〜 {cycle.ends_on} ·{" "}
+                  買い物日：{cycle.shopping_on}（
+                  {
+                    "日月火水木金土"[
+                      new Date(cycle.shopping_on + "T00:00:00Z").getUTCDay()
+                    ]
+                  }
+                  ） · 対象：{cycle.starts_on} 〜 {cycle.ends_on} ·{" "}
                   {cycle.status === "confirmed"
                     ? "購入確定済み"
                     : "未購入・確認待ち"}
                 </p>
+                {!!cycle.unplanned_dates?.length && (
+                  <p role="status" className="notice">
+                    献立未作成の日：{cycle.unplanned_dates.join("・")}
+                    。表示量は作成済みの献立だけです。上のボタンで期間全体を生成できます。
+                  </p>
+                )}
                 <p className="muted">
-                  献立全体の不足量です。購入しなかった項目は0に変更してください。
+                  献立全体の不足量です。購入済みの量だけ確定してください。購入しなかった項目は0に変更してください。
                 </p>
                 {cycle.items.length ? (
                   <form
@@ -662,7 +755,7 @@ function App() {
               </section>
             ) : (
               <p className="empty">
-                買い物日、または買い足しを許可して献立を生成すると、不足量を表示します。
+                次回買い物の献立・リストを生成してください。旧曜日のリストは確定できません。曜日変更前の未確定リストがある場合は、設定画面から確認して作り直せます。
               </p>
             )}
           </>
@@ -701,7 +794,7 @@ function App() {
             save={(value) =>
               run(
                 () => api("/settings", value, "PUT"),
-                "設定を保存しました。新しい条件は次の献立生成から適用されます",
+                "設定を保存しました。確認された旧未確定リストを無効化し、新曜日の不足量を再計算しました。未作成の日は買い物画面から生成してください",
               )
             }
           />
@@ -736,7 +829,7 @@ function SettingsForm({
 }: {
   settings: Settings;
   busy: boolean;
-  save: (s: Settings) => void;
+  save: (s: Settings & { discardPendingShopping?: boolean }) => void;
 }) {
   const [s, setS] = useState(settings);
   useEffect(() => setS(settings), [settings]);
@@ -753,7 +846,18 @@ function SettingsForm({
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          save(s);
+          const changed = !sameShoppingDays(
+            s.shoppingDays,
+            settings.shoppingDays,
+          );
+          if (
+            changed &&
+            !window.confirm(
+              "買い物曜日を変更します。旧曜日の未確定リストを無効化し、新曜日で不足量を再計算します。既存の献立・在庫・食事記録・確定済み購入は保持します。続けますか？",
+            )
+          )
+            return;
+          save({ ...s, discardPendingShopping: changed });
         }}
       >
         {fields.map(([key, label]) => (
@@ -773,7 +877,7 @@ function SettingsForm({
           <legend>買い物曜日（2つ選択）</legend>
           <p className="muted">
             週2回のまとめ買い向けです。次の買い物日の前日までの献立と不足食材を計算します。
-            水・木に買い物できない場合は、例として火・土を選べます。
+            火・土の運用では、火〜金の4日分と土〜月の3日分です。
           </p>
           <div className="weekdays">
             {[0, 1, 2, 3, 4, 5, 6].map((d) => (
@@ -839,6 +943,21 @@ function SettingsForm({
           設定を保存
         </button>
       </form>
+      <button
+        type="button"
+        className="secondary"
+        disabled={busy || s.shoppingDays.length !== 2}
+        onClick={() => {
+          if (
+            window.confirm(
+              "旧曜日の未確定リストを無効化し、選択中の曜日で作り直します。在庫・献立・確定済み購入・食事記録は保持します。続けますか？",
+            )
+          )
+            save({ ...s, discardPendingShopping: true });
+        }}
+      >
+        旧曜日の未確定リストを確認して作り直す
+      </button>
       <p className="muted">
         日本時間（Asia/Tokyo）。朝食なし・就寝前プロテインは未確認の予測です。プリセット編集と写真取り込みは後続の実装範囲です。
       </p>

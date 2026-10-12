@@ -1,4 +1,4 @@
-# API contract v1.1 (MVP / Issue #2)
+# API contract v1.2 (MVP / Issue #4)
 
 同一オリジンの `/api`。JSON本文、全ての非ログインAPIに署名Cookieが必要です。POST / PUT は別オリジンから拒否します。`APP_PASSWORD` が未設定または32文字未満なら503。クライアントは401でログイン画面へ戻ります。
 
@@ -16,17 +16,17 @@
 | GET /recipes                         | 栄養・食材・手順付きのカタログ                                                                                                    |
 | GET /plans                           | 日付順の献立                                                                                                                      |
 | POST /plans/generate                 | `{startDate:"YYYY-MM-DD", allowPurchase?:boolean}`                                                                                |
-| POST /plans/:id/regenerate           | `{version, allowPurchase?:boolean}`、指定日から周期末までの開いた日を再計画                                                       |
+| POST /plans/:id/regenerate           | `{version, recipeId, allowPurchase?:boolean}`、選んだ候補へ指定日だけ変更。未購入リストを原子的に再計算                           |
 | POST /plans/:id/complete             | `{version, idempotencyKey, items:[{ingredientId,amount}]}`                                                                        |
 | POST /plans/:id/skip                 | `{version}`                                                                                                                       |
-| POST /plans/:id/unskip               | `{version}`、本日以降のスキップを元の料理の予定に戻し、未確定の買い物リストを再計算。過去分・二重実行は拒否                 |
-| GET /shopping/current                | 今日を含む周期、未購入/購入済み数量                                                                                               |
+| POST /plans/:id/unskip               | `{version}`、本日以降のスキップを元の料理の予定に戻し、未確定の買い物リストを再計算。過去分・二重実行は拒否                       |
+| GET /shopping/current                | 現在の曜日に合う次回買い物の周期を優先、未購入/購入済み数量・未作成の日付                                                         |
 | POST /shopping/:id/confirm           | `{version, idempotencyKey, items:[{ingredientId,amount}]}`、全リスト項目を指定。未購入は0                                         |
 | GET /meal-logs                       | 直近100件の元の確定スナップショット                                                                                               |
 | GET /meal-logs/:id                   | 食材スナップショット・訂正履歴を含む                                                                                              |
 | POST /meal-logs/:id/correct          | `{version, idempotencyKey, items:[{ingredientId,amount}]}`、versionは訂正番号（初回0）。全実使用量を置換する訂正スナップショット  |
 | GET /settings                        | version付き設定                                                                                                                   |
-| PUT /settings                        | GETの完全な設定オブジェクト。曜日は0=日〜6=土、重複なし2日                                                                        |
+| PUT /settings                        | GETの設定＋`discardPendingShopping?:boolean`。曜日は0=日〜6=土、重複なし2日                                                       |
 | GET /daily-nutrition?date=YYYY-MM-DD | confirmed / projected / unknown を独立して返す                                                                                    |
 | PUT /daily-food-entries/:date        | `[{mealType, status, kcal, protein}]`。mealType=breakfast/lunch/snack/bedtime、status=projected/confirmed。その日の手入力を全置換 |
 
@@ -55,3 +55,17 @@
 買い物確認は表示される通常食材のみを送信します。調味料は既存の買い物行からも除外し、数量やstatusの更新を行いません。通常食材がない周期は `items: []` で確定可能です。新規確認で調味料を送信すると422です。未購入リストを再計算するときも既存の調味料行は削除せず保持します。
 
 新しいクライアントは `recipe.items` 全体を完了本文へ転送せず、通常食材のIDと量だけに絞ります。更新前に成功済みの操作は同じ元の本文・キーで再送すると元の結果を返し、新しい在庫移動は作りません。`0004` と新Worker/UIをセットで更新してください。
+
+## 曜日変更と候補比較（v1.2）
+
+`POST /plans/:id/candidates` は `{version, allowPurchase?:boolean, exclude?:string[]}` を受け、`{planId, version, candidates:[{recipe, missing:[{ingredientId,name,amount,unit}]}], hasMore}` を返します。最大5件、現在と以前変更して外した料理は除外し、同じ材料構成に偏りにくい順で提示します。次ページは表示済みIDを `exclude` に渡します。取得のみではDBを変更しません。0件も正常応答で理由を画面に表示します。
+
+`regenerate` は `recipeId` 必須へ変更しました。旧クライアントの即時自動変更は400となるので画面を再読み込みしてください。選択確定時も条件・在庫を再判定し、変更済みversionは409、却下済み・不適合レシピは422。変更は当日のみで、後続料理は維持して全未購入リストを再計算します。確定済み購入期間では不足を購入提案に追加せず、在庫追加を案内します。
+
+`PUT /settings` は曜日変更によって旧未確定リストが残る場合、`discardPendingShopping:true` の明示確認がないと409 `SHOPPING_RESET_REQUIRED`（details.pendingLists）で全体を拒否します。承認後は旧reviewを `obsolete=1` として保持し、次回期間を既存献立から再計算します。新たな料理の生成は行いません。すでに曜日だけ変更済みの旧不整合リストも同じフラグで修復できます。
+
+cycleは `obsolete`, `shopping_days_json`, `unplanned_dates` を追加しました。次回リストがあればそれを優先し、なければ現在期間の整合するリストを返します。旧設定のreviewは表示・仮想購入から除外し、IDを直接送っても409 `OBSOLETE_SHOPPING`。購入済みリストと再送結果は不変です。火・土なら10/13〜10/16（4日）と10/17〜10/19（3日）。未作成日がある場合、表示量は作成済みの料理だけであり、UIから明示的に期間の献立を生成します。
+
+`0005` を既存のバックアップ付き手動リリースで適用します。過去のリストは削除しません。同じ開始日の未確定行だけは、破棄承認後に高いversionで再利用できます。確定済み行は再利用せず、衝突する期間は409。実在庫・履歴・スナップショットは変更しません。本番への自動更新は禁止です。
+
+次回購入量は対象期間の献立だけから算出し、過去の未完了献立や買い物前の不足を追加購入量に混ぜません。本日以降の先行献立は実在庫の利用可能分を予約し、現在の設定に合う将来の先行購入提案だけを一度投影します。

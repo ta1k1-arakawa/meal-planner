@@ -3,6 +3,7 @@ import {
   addDays,
   tokyoDate,
   cycleEnd,
+  nextShoppingDate,
   allocate,
   eligible,
   chooseRecipe,
@@ -63,6 +64,12 @@ describe("deterministic planner rules", () => {
   it("alternates 3 and 4 dinner days for twice-weekly shopping", () => {
     expect(cycleEnd("2026-10-11", [0, 3])).toBe("2026-10-13");
     expect(cycleEnd("2026-10-14", [0, 3])).toBe("2026-10-17");
+  });
+  it("previews Tue-Fri four dinners and Sat-Mon three before the shopping day", () => {
+    expect(nextShoppingDate("2026-10-12", [2, 6])).toBe("2026-10-13");
+    expect(cycleEnd("2026-10-13", [2, 6])).toBe("2026-10-16");
+    expect(nextShoppingDate("2026-10-16", [2, 6])).toBe("2026-10-17");
+    expect(cycleEnd("2026-10-17", [2, 6])).toBe("2026-10-19");
   });
   it("computes cumulative shortages rather than per-recipe independent deficits", () => {
     const stock = new Map([["rice", 400]]),

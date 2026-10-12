@@ -1,15 +1,34 @@
-import { beforeAll, afterAll, beforeEach, describe, expect, it } from "vitest";
+import {
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+  vi,
+  describe,
+  expect,
+  it,
+} from "vitest";
 import { Miniflare } from "miniflare";
 import { readFileSync } from "node:fs";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { RecipeDetails } from "../src/RecipeDetails";
-import { ingredients as loadIngredients } from "../worker/db";
+import { RecipeCandidatePicker } from "../src/RecipeCandidatePicker";
+import {
+  ingredients as loadIngredients,
+  shopping as loadShopping,
+} from "../worker/db";
 import { eligible, nutrition } from "../worker/planner";
 import type { RecipeItem } from "../worker/contracts";
 import app, { type Env } from "../worker/index";
 import { tokyoDate, cycleEnd, addDays } from "../worker/planner";
-import type { Plan, Cycle, Stock, Settings } from "../worker/contracts";
+import type {
+  Plan,
+  Cycle,
+  Stock,
+  Settings,
+  RecipeCandidates,
+} from "../worker/contracts";
 let mf: Miniflare, database: D1Database, cookie: string, env: Env;
 let databaseIndex = 0;
 const managedItems = (recipe: Plan["recipe"]) =>
@@ -40,8 +59,12 @@ async function get<T>(path: string): Promise<T> {
   expect(r.status).toBe(200);
   return r.json() as Promise<T>;
 }
-async function post<T>(path: string, body: unknown): Promise<T> {
-  const r = await request(path, body);
+async function post<T>(
+  path: string,
+  body: unknown,
+  method = "POST",
+): Promise<T> {
+  const r = await request(path, body, method);
   expect(r.status, await r.clone().text()).toBe(200);
   return r.json() as Promise<T>;
 }
@@ -63,7 +86,7 @@ beforeAll(async () => {
   mf = new Miniflare({
     modules: true,
     script: 'export default {fetch(){return new Response("test")}}',
-    d1Databases: Array.from({ length: 30 }, (_, i) => "DB_" + i),
+    d1Databases: Array.from({ length: 60 }, (_, i) => "DB_" + i),
     compatibilityDate: "2026-08-01",
   });
   database = (await mf.getD1Database("DB_0")) as unknown as D1Database;
@@ -94,9 +117,10 @@ beforeEach(async (context) => {
     "0002_seed.sql",
     "0003_corrections.sql",
     "0004_pantry_recipe_details.sql",
+    "0005_shopping_schedule_candidates.sql",
   ]) {
     if (
-      file.startsWith("0004") &&
+      (file.startsWith("0004") || file.startsWith("0005")) &&
       context.task.name.startsWith("upgrades populated")
     )
       continue;
@@ -375,6 +399,7 @@ describe("cycle planner and shopping", () => {
     const later = ps[1];
     await post("/plans/" + later.id + "/regenerate", {
       version: later.version,
+      recipeId: (await candidatePage(later)).candidates[0].recipe.id,
       allowPurchase: true,
     });
     const changed = await get<Plan[]>("/plans");
@@ -408,32 +433,51 @@ describe("cycle planner and shopping", () => {
     const generated = await generation();
     const first = generated[0];
     const initial = await get<Cycle>("/shopping/current");
-    const rice = initial.items.find((i) => i.ingredient_id === "rice")!.proposed_amount;
+    const rice = initial.items.find(
+      (i) => i.ingredient_id === "rice",
+    )!.proposed_amount;
     const stockBefore = await get<Stock[]>("/inventory");
 
     await post("/plans/" + first.id + "/skip", { version: first.version });
-    const skipped = (await get<Plan[]>("/plans")).find((p) => p.id === first.id)!;
+    const skipped = (await get<Plan[]>("/plans")).find(
+      (p) => p.id === first.id,
+    )!;
     expect(skipped.status).toBe("skipped");
     const skippedCycle = await get<Cycle>("/shopping/current");
-    expect(skippedCycle.items.find((i) => i.ingredient_id === "rice")?.proposed_amount).toBe(rice - 350);
+    expect(
+      skippedCycle.items.find((i) => i.ingredient_id === "rice")
+        ?.proposed_amount,
+    ).toBe(rice - 350);
 
     await post("/plans/" + first.id + "/unskip", { version: skipped.version });
-    const restored = (await get<Plan[]>("/plans")).find((p) => p.id === first.id)!;
+    const restored = (await get<Plan[]>("/plans")).find(
+      (p) => p.id === first.id,
+    )!;
     expect(restored.status).toBe("planned");
     expect(restored.recipe.id).toBe(first.recipe.id);
     expect(restored.version).toBe(skipped.version + 1);
     const restoredCycle = await get<Cycle>("/shopping/current");
-    expect(restoredCycle.items.find((i) => i.ingredient_id === "rice")?.proposed_amount).toBe(rice);
+    expect(
+      restoredCycle.items.find((i) => i.ingredient_id === "rice")
+        ?.proposed_amount,
+    ).toBe(rice);
     expect(await get<Stock[]>("/inventory")).toEqual(stockBefore);
 
     expect(
-      (await request("/plans/" + first.id + "/unskip", { version: skipped.version })).status,
+      (
+        await request("/plans/" + first.id + "/unskip", {
+          version: skipped.version,
+        })
+      ).status,
     ).toBe(409);
     await post("/plans/" + first.id + "/regenerate", {
       version: restored.version,
+      recipeId: (await candidatePage(restored)).candidates[0].recipe.id,
       allowPurchase: true,
     });
-    const changed = (await get<Plan[]>("/plans")).find((p) => p.id === first.id)!;
+    const changed = (await get<Plan[]>("/plans")).find(
+      (p) => p.id === first.id,
+    )!;
     expect(changed.recipe.id).not.toBe(first.recipe.id);
   });
   it("does not allow restoring a skipped dinner in the past", async () => {
@@ -444,10 +488,16 @@ describe("cycle planner and shopping", () => {
       .prepare("UPDATE meal_plans SET local_date=? WHERE id=?")
       .bind(addDays(tokyoDate(), -1), first.id)
       .run();
-    const skipped = (await get<Plan[]>("/plans")).find((p) => p.id === first.id)!;
-    const r = await request("/plans/" + first.id + "/unskip", { version: skipped.version });
+    const skipped = (await get<Plan[]>("/plans")).find(
+      (p) => p.id === first.id,
+    )!;
+    const r = await request("/plans/" + first.id + "/unskip", {
+      version: skipped.version,
+    });
     expect(r.status).toBe(422);
-    expect((await get<Plan[]>("/plans")).find((p) => p.id === first.id)?.status).toBe("skipped");
+    expect(
+      (await get<Plan[]>("/plans")).find((p) => p.id === first.id)?.status,
+    ).toBe("skipped");
   });
   it("uses stock-only planning on non-shopping days and reserves earlier plans", async () => {
     const date = tokyoDate(),
@@ -476,14 +526,11 @@ describe("cycle planner and shopping", () => {
       version: stocks.find((s) => s.id === "rice")!.version,
       idempotencyKey: "reduce-rice-key",
     });
-    expect(
-      (
-        await request("/plans/" + plans[1].id + "/regenerate", {
-          version: plans[1].version,
-          allowPurchase: false,
-        })
-      ).status,
-    ).toBe(422);
+    const empty = await post<RecipeCandidates>(
+      "/plans/" + plans[1].id + "/candidates",
+      { version: plans[1].version, allowPurchase: false },
+    );
+    expect(empty.candidates).toEqual([]);
     expect(
       (await get<Stock[]>("/inventory")).find((s) => s.id === "rice")?.quantity,
     ).toBe(350);
@@ -974,7 +1021,7 @@ describe("pantry classification and recipe detail acceptance", () => {
         .prepare(
           "INSERT INTO shopping_cycles(id,starts_on,ends_on,shopping_on,status) VALUES ('legacy-cycle',?,?,?,'review')",
         )
-        .bind(tokyoDate(), addDays(tokyoDate(), 3), tokyoDate()),
+        .bind(tokyoDate(), cycleEnd(tokyoDate(), [0, 3]), tokyoDate()),
       database.prepare(
         "INSERT INTO shopping_items VALUES ('legacy-shop-oil','legacy-cycle','oil',45,45,NULL,'g','review')",
       ),
@@ -1012,6 +1059,18 @@ describe("pantry classification and recipe detail acceptance", () => {
           .all<Record<string, unknown>>()
       ).results;
     await applyMigration("0004_pantry_recipe_details.sql");
+    for (const table of tables) {
+      const after = (
+        await database
+          .prepare("SELECT * FROM " + table + " ORDER BY rowid")
+          .all<Record<string, unknown>>()
+      ).results;
+      expect(after).toHaveLength(before[table].length);
+      after.forEach((row, index) =>
+        expect(row).toMatchObject(before[table][index]),
+      );
+    }
+    await applyMigration("0005_shopping_schedule_candidates.sql");
     for (const table of tables) {
       const after = (
         await database
@@ -1085,5 +1144,422 @@ describe("pantry classification and recipe detail acceptance", () => {
         )
         .run(),
     ).rejects.toThrow();
+  });
+});
+
+async function candidatePage(
+  plan: Plan,
+  allowPurchase = true,
+  exclude: string[] = [],
+) {
+  return post<RecipeCandidates>("/plans/" + plan.id + "/candidates", {
+    version: plan.version,
+    allowPurchase,
+    exclude,
+  });
+}
+async function atDate(date: string) {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date(date + "T03:00:00Z"));
+  const login = await request(
+    "/auth/login",
+    { password: env.APP_PASSWORD },
+    "POST",
+    false,
+  );
+  cookie = login.headers.get("set-cookie")!.split(";")[0];
+}
+afterEach(() => vi.useRealTimers());
+async function purchaseBody(cycle: Cycle) {
+  return {
+    version: cycle.version,
+    idempotencyKey: crypto.randomUUID(),
+    items: cycle.items.map((i) => ({
+      ingredientId: i.ingredient_id,
+      amount: i.proposed_amount,
+    })),
+  };
+}
+
+describe("Issue #4 shopping schedule and candidate selection", () => {
+  it("requires confirmation, invalidates the old Sun-Wed list, and previews Tue-Fri before shopping day", async () => {
+    await atDate("2026-10-11");
+    await post("/plans/generate", {
+      startDate: "2026-10-11",
+      allowPurchase: true,
+    });
+    const old = await get<Cycle>("/shopping/current");
+    expect(old.ends_on).toBe("2026-10-13");
+    const oldPlans = await get<Plan[]>("/plans");
+    const stocks = await get<Stock[]>("/inventory");
+    await atDate("2026-10-12");
+    const settings = await get<Settings>("/settings");
+    expect(
+      (await request("/settings", { ...settings, shoppingDays: [2, 6] }, "PUT"))
+        .status,
+    ).toBe(409);
+    expect(await get<Settings>("/settings")).toEqual(settings);
+    expect(await get<Cycle>("/shopping/current")).toEqual(old);
+    await post(
+      "/settings",
+      { ...settings, shoppingDays: [2, 6], discardPendingShopping: true },
+      "PUT",
+    );
+    expect(
+      (
+        await request(
+          "/shopping/" + old.id + "/confirm",
+          await purchaseBody(old),
+        )
+      ).status,
+    ).toBe(409);
+    expect(await get<Stock[]>("/inventory")).toEqual(stocks);
+    expect(await get<Plan[]>("/plans")).toEqual(oldPlans);
+    const oldRow = await database
+      .prepare("SELECT * FROM shopping_cycles WHERE id=?")
+      .bind(old.id)
+      .first();
+    expect(oldRow).toMatchObject({
+      status: "review",
+      obsolete: 1,
+      ends_on: "2026-10-13",
+    });
+    await post("/plans/generate", {
+      startDate: "2026-10-13",
+      allowPurchase: true,
+    });
+    const next = await get<Cycle>("/shopping/current");
+    expect(next).toMatchObject({
+      starts_on: "2026-10-13",
+      ends_on: "2026-10-16",
+      shopping_on: "2026-10-13",
+      unplanned_dates: [],
+    });
+    const ps = await get<Plan[]>("/plans");
+    const totalRice = ps
+      .filter(
+        (p) =>
+          p.status === "planned" &&
+          p.local_date >= "2026-10-13" &&
+          p.local_date <= "2026-10-16",
+      )
+      .reduce(
+        (sum, p) =>
+          sum + p.recipe.items.find((i) => i.ingredientId === "rice")!.amount,
+        0,
+      );
+    expect(
+      next.items.find((i) => i.ingredient_id === "rice")!.proposed_amount,
+    ).toBe(totalRice);
+    expect(totalRice).toBe(1400);
+    expect(next.id).not.toBe(old.id);
+  });
+  it("repairs lists left stale before deployment even when settings already say Tue-Sat", async () => {
+    await atDate("2026-10-11");
+    await generation();
+    const old = await get<Cycle>("/shopping/current");
+    await database
+      .prepare(
+        "UPDATE app_settings SET shopping_days_json='[2,6]', version=version+1 WHERE id=1",
+      )
+      .run();
+    await atDate("2026-10-12");
+    expect(await get("/shopping/current")).toBeNull();
+    expect(
+      (
+        await request(
+          "/shopping/" + old.id + "/confirm",
+          await purchaseBody(old),
+        )
+      ).status,
+    ).toBe(409);
+    const s = await get<Settings>("/settings");
+    await post("/settings", { ...s, discardPendingShopping: true }, "PUT");
+    expect(await get<Cycle>("/shopping/current")).toMatchObject({
+      shopping_on: "2026-10-13",
+      ends_on: "2026-10-16",
+    });
+  });
+  it("reuses a discarded pending start safely when one shopping weekday remains the same", async () => {
+    await atDate("2026-10-11");
+    await generation();
+    const old = await get<Cycle>("/shopping/current");
+    const s = await get<Settings>("/settings");
+    await post(
+      "/settings",
+      { ...s, shoppingDays: [0, 6], discardPendingShopping: true },
+      "PUT",
+    );
+    const updated = await get<Cycle>("/shopping/current");
+    expect(updated).toMatchObject({
+      id: old.id,
+      ends_on: "2026-10-16",
+      obsolete: 0,
+    });
+    expect(updated.version).toBeGreaterThan(old.version);
+    expect(
+      (
+        await request(
+          "/shopping/" + old.id + "/confirm",
+          await purchaseBody(old),
+        )
+      ).status,
+    ).toBe(409);
+  });
+  it("preserves confirmed purchases, stock ledger and meals when weekdays change", async () => {
+    await atDate("2026-10-11");
+    await generation();
+    const cycle = await get<Cycle>("/shopping/current");
+    const body = await purchaseBody(cycle);
+    await post("/shopping/" + cycle.id + "/confirm", body);
+    const first = (await get<Plan[]>("/plans"))[0];
+    await post("/plans/" + first.id + "/complete", {
+      version: first.version,
+      idempotencyKey: crypto.randomUUID(),
+      items: managedItems(first.recipe),
+    });
+    const insufficient = (await get<Plan[]>("/plans")).find(
+      (p) => p.status === "planned",
+    )!;
+    expect((await candidatePage(insufficient, true)).candidates).toEqual([]);
+    await fill();
+    const tables = [
+      "inventory_stocks",
+      "inventory_movements",
+      "meal_logs",
+      "meal_log_items",
+      "operations",
+      "shopping_cycles",
+      "shopping_items",
+    ];
+    const before = new Map<string, unknown[]>();
+    for (const table of tables)
+      before.set(
+        table,
+        (
+          await database
+            .prepare("SELECT * FROM " + table + " ORDER BY rowid")
+            .all()
+        ).results,
+      );
+    const pendingPlan = (await get<Plan[]>("/plans")).find(
+      (p) => p.status === "planned",
+    )!;
+    const candidates = await candidatePage(pendingPlan);
+    expect(candidates.candidates.length).toBeGreaterThan(0);
+    await post("/plans/" + pendingPlan.id + "/regenerate", {
+      version: pendingPlan.version,
+      recipeId: candidates.candidates[0].recipe.id,
+      allowPurchase: true,
+    });
+    for (const table of tables)
+      expect(
+        (
+          await database
+            .prepare("SELECT * FROM " + table + " ORDER BY rowid")
+            .all()
+        ).results,
+      ).toEqual(before.get(table));
+    const s = await get<Settings>("/settings");
+    await post(
+      "/settings",
+      { ...s, shoppingDays: [2, 6], discardPendingShopping: true },
+      "PUT",
+    );
+    for (const table of tables) {
+      const after = (
+        await database
+          .prepare("SELECT * FROM " + table + " ORDER BY rowid")
+          .all()
+      ).results;
+      if (table === "shopping_cycles" || table === "shopping_items") {
+        for (const original of before.get(table) ?? [])
+          expect(after).toContainEqual(original);
+      } else expect(after).toEqual(before.get(table));
+    }
+    expect(await post("/shopping/" + cycle.id + "/confirm", body)).toEqual({
+      cycleId: cycle.id,
+    });
+    expect(
+      (await get<Plan[]>("/plans")).find((p) => p.id === first.id)?.status,
+    ).toBe("completed");
+  });
+  it("repeats Tue-Sat 4/3 day cycles without duplicate reviews or double purchases", async () => {
+    await atDate("2026-10-13");
+    const s = await get<Settings>("/settings");
+    await post("/settings", { ...s, shoppingDays: [2, 6] }, "PUT");
+    await post("/plans/generate", {
+      startDate: "2026-10-13",
+      allowPurchase: true,
+    });
+    await post("/plans/generate", {
+      startDate: "2026-10-17",
+      allowPurchase: true,
+    });
+    await post("/plans/generate", {
+      startDate: "2026-10-20",
+      allowPurchase: true,
+    });
+    const first = (await loadShopping(database, "2026-10-13"))!;
+    const second = (await loadShopping(database, "2026-10-17"))!;
+    expect(first.ends_on).toBe("2026-10-16");
+    expect(second.ends_on).toBe("2026-10-19");
+    expect(
+      first.items.find((i) => i.ingredient_id === "rice")!.proposed_amount,
+    ).toBe(1400);
+    expect(
+      second.items.find((i) => i.ingredient_id === "rice")!.proposed_amount,
+    ).toBe(1050);
+    const body = await purchaseBody(first);
+    await post("/shopping/" + first.id + "/confirm", body);
+    const stocks = await get<Stock[]>("/inventory");
+    await post("/shopping/" + first.id + "/confirm", body);
+    expect(await get<Stock[]>("/inventory")).toEqual(stocks);
+    const next = (await loadShopping(database, "2026-10-17"))!;
+    expect(
+      next.items.find((i) => i.ingredient_id === "rice")!.proposed_amount,
+    ).toBe(1050);
+    expect(
+      (
+        await database
+          .prepare(
+            "SELECT id FROM shopping_cycles WHERE status='review' AND obsolete=0",
+          )
+          .all()
+      ).results,
+    ).toHaveLength(2);
+  });
+  it("offers comparable diverse pages without mutations, selects any candidate and excludes rejected recipes", async () => {
+    await atDate("2026-10-13");
+    const s = await get<Settings>("/settings");
+    await post("/settings", { ...s, shoppingDays: [2, 6] }, "PUT");
+    await generation();
+    const original = (await get<Plan[]>("/plans"))[1];
+    const before = await get<Plan[]>("/plans");
+    const stocks = await get<Stock[]>("/inventory");
+    const page = await candidatePage(original);
+    const html = renderToStaticMarkup(
+      createElement(RecipeCandidatePicker, {
+        plan: original,
+        page,
+        busy: false,
+        select: () => {},
+        next: () => {},
+        cancel: () => {},
+      }),
+    );
+    for (const c of page.candidates) {
+      expect(html).toContain(c.recipe.title);
+      expect(html).toContain(String(c.recipe.kcal));
+      expect(html).toContain(String(c.recipe.protein));
+      for (const missing of c.missing)
+        expect(html).toContain(
+          `${missing.name} ${missing.amount}${missing.unit}`,
+        );
+    }
+    expect(html).toContain("この料理に変更して確定");
+    expect(html).toContain("表示済みを除いて次の候補を見る");
+    expect(page.candidates).toHaveLength(5);
+    expect(
+      page.candidates.every(
+        (c) =>
+          c.recipe.id !== original.recipe.id &&
+          c.recipe.total_minutes <= 30 &&
+          c.missing.every(
+            (i) =>
+              i.amount > 0 &&
+              !["oil", "soy", "miso", "sugar", "curry"].includes(
+                i.ingredientId,
+              ),
+          ),
+      ),
+    ).toBe(true);
+    expect(
+      new Set(
+        page.candidates.map((c) =>
+          c.recipe.items
+            .filter((i) => !i.inventory_exempt)
+            .map((i) => i.ingredientId)
+            .sort()
+            .join(","),
+        ),
+      ).size,
+    ).toBeGreaterThan(1);
+    const another = await candidatePage(
+      original,
+      true,
+      page.candidates.map((c) => c.recipe.id),
+    );
+    expect(
+      another.candidates.every(
+        (c) =>
+          !page.candidates.some((first) => first.recipe.id === c.recipe.id),
+      ),
+    ).toBe(true);
+    expect(await get<Plan[]>("/plans")).toEqual(before);
+    const chosen = page.candidates[3].recipe;
+    await post("/plans/" + original.id + "/regenerate", {
+      version: original.version,
+      recipeId: chosen.id,
+      allowPurchase: true,
+    });
+    const current = (await get<Plan[]>("/plans")).find(
+      (p) => p.id === original.id,
+    )!;
+    expect(current.recipe.id).toBe(chosen.id);
+    expect(
+      (await get<Plan[]>("/plans")).filter((p) => p.id !== original.id),
+    ).toEqual(before.filter((p) => p.id !== original.id));
+    expect(await get<Stock[]>("/inventory")).toEqual(stocks);
+    const newPage = await candidatePage(current);
+    expect(
+      newPage.candidates.some((c) =>
+        [original.recipe.id, chosen.id].includes(c.recipe.id),
+      ),
+    ).toBe(false);
+    expect(
+      (
+        await request("/plans/" + original.id + "/regenerate", {
+          version: current.version,
+          recipeId: original.recipe.id,
+          allowPurchase: true,
+        })
+      ).status,
+    ).toBe(422);
+    expect(
+      (
+        await request("/plans/" + original.id + "/regenerate", {
+          version: original.version,
+          recipeId: chosen.id,
+          allowPurchase: true,
+        })
+      ).status,
+    ).toBe(409);
+    const cycle = await get<Cycle>("/shopping/current");
+    const rice = (await get<Plan[]>("/plans")).reduce(
+      (sum, p) =>
+        sum + p.recipe.items.find((i) => i.ingredientId === "rice")!.amount,
+      0,
+    );
+    expect(
+      cycle.items.find((i) => i.ingredient_id === "rice")!.proposed_amount,
+    ).toBe(rice);
+  });
+  it("rechecks equipment and allergy changes when a previously offered recipe is selected", async () => {
+    await generation();
+    const plan = (await get<Plan[]>("/plans"))[0];
+    const page = await candidatePage(plan);
+    const s = await get<Settings>("/settings");
+    await post("/settings", { ...s, equipment: [] }, "PUT");
+    expect(
+      (
+        await request("/plans/" + plan.id + "/regenerate", {
+          version: plan.version,
+          recipeId: page.candidates[0].recipe.id,
+          allowPurchase: true,
+        })
+      ).status,
+    ).toBe(422);
+    expect((await candidatePage(plan)).candidates).toEqual([]);
   });
 });

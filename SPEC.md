@@ -1,4 +1,4 @@
-# Dinner Planner — Product / Technical Specification v1.2
+# Dinner Planner — Product / Technical Specification v1.3
 
 ## Scope and operating assumptions
 
@@ -27,6 +27,16 @@ All 30 initial recipes show named foods, exact canonical quantities, seasoning m
 ## Shopping lifecycle
 
 `shopping_cycles`: date range, scheduled shopping date, status. `shopping_items`: planned need, proposed purchase, actual purchase, unit, review/confirmed status. On purchase confirmation, perform atomic stock increase + movement writes. Use an idempotency token to avoid double additions. Some purchases can be omitted or quantity-edited. Do not assume photo-extracted amount has been purchased until confirmed.
+
+## Shopping schedule changes and recipe selection (Issue #4)
+
+Keep arbitrary two distinct shopping weekdays editable. The current operation uses Tuesday/Saturday: Tuesday–Friday four dinners, Saturday–Monday three. Do not include shortages from past or pre-shopping dinners in the next period's purchase quantity; earlier open dinners reserve available actual stock, while valid future earlier proposals are projected once. Preview the next shopping period before its shopping date; show the actual shopping date and covered dates explicitly. Reading a preview never increases stock. Purchase confirmation means actual purchases, never intention to purchase.
+
+Changing shopping weekdays requires explicit confirmation when pending lists exist. Mark old review cycles obsolete and recompute the next period from existing plans atomically with settings. Never overwrite existing recipes just for changing weekdays. Show unplanned dates and let the user explicitly generate the full next period. Completed/skipped dinners, confirmed cycles/items, inventory ledger and meal snapshots stay unchanged. Repair already stale reviews via the same confirmed operation even if the current setting already contains the new weekdays.
+
+Use additive migration `0005`: obsolete flag and schedule snapshot on cycles, plus per-plan rejected recipes. Leave migrations `0001`–`0004` immutable. Keep obsolete records; exclude them and any reviews inconsistent with the current schedule from reads, purchase confirmation and projected purchases. If a review at the same unique start date is explicitly discarded, reuse its row with a higher version and recalculated unconfirmed items; never reuse or rewrite a confirmed row. A conflicting confirmed start date is rejected and additional quantities require explicit stock registration. Settings/list/stock/plan versions guard atomic recomputation against concurrent writes.
+
+Recipe changes offer up to five ranked candidates with missing named ingredient amounts, kcal/protein and cooking time. Viewing/cancelling does not mutate plans. Prefer distinct ingredient combinations before seasoning variations and allow paging through undisplayed candidates. Exclude the current recipe and recipes previously changed away from on the same plan. Empty/exhausted sets are explained; never silently reset exclusions. On user selection revalidate recipe, stock, equipment/allergen constraints and plan version, then update only that date, record the old recipe as rejected and reconcile all pending lists in one batch. Preserve later recipes and immutable purchases; for confirmed periods require enough stock for the replacement and later dinners. The 30-recipe catalog is still largely five main ingredient families × six seasoning styles; new recipe families can be added independently.
 
 ## Photo recognition
 
