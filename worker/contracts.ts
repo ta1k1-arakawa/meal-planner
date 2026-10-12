@@ -57,6 +57,18 @@ export const generateSchema = z
 export const versionSchema = z
   .object({ version: z.number().int().min(0) })
   .strict();
+export const candidatesSchema = versionSchema
+  .extend({
+    allowPurchase: z.boolean().default(false),
+    exclude: z.array(z.string().min(1).max(80)).max(100).default([]),
+  })
+  .strict();
+export const selectRecipeSchema = versionSchema
+  .extend({
+    allowPurchase: z.boolean().default(false),
+    recipeId: z.string().min(1).max(80),
+  })
+  .strict();
 export const settingsSchema = z
   .object({
     version: z.number().int().min(0),
@@ -72,6 +84,7 @@ export const settingsSchema = z
     equipment: z.array(z.string().min(1).max(50)).max(20),
     allergies: z.array(z.string().min(1).max(50)).max(30),
     excludedIngredients: z.array(z.string().min(1).max(80)).max(80),
+    discardPendingShopping: z.boolean().default(false),
   })
   .strict();
 export interface Ingredient {
@@ -152,6 +165,23 @@ export interface Cycle {
   status: "review" | "confirmed";
   version: number;
   items: ShoppingItem[];
+  obsolete: number;
+  shopping_days_json: string;
+  unplanned_dates?: string[];
+}
+export interface RecipeCandidates {
+  planId: string;
+  version: number;
+  candidates: {
+    recipe: Recipe;
+    missing: {
+      ingredientId: string;
+      name: string;
+      amount: number;
+      unit: string;
+    }[];
+  }[];
+  hasMore: boolean;
 }
 export interface MealLog {
   id: string;

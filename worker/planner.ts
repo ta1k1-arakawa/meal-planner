@@ -33,6 +33,38 @@ export function cycleEnd(start: string, shoppingDays: number[]): string {
     422,
   );
 }
+export function nextShoppingDate(date: string, days: number[]): string {
+  for (let n = 0; n < 7; n++) {
+    const candidate = addDays(date, n);
+    if (days.includes(new Date(candidate + "T00:00:00Z").getUTCDay()))
+      return candidate;
+  }
+  throw new DomainError(
+    "INVALID_SHOPPING_DAYS",
+    "買い物曜日を設定してください",
+    422,
+  );
+}
+export function sameShoppingDays(a: number[], b: number[]) {
+  return [...a].sort().join(",") === [...b].sort().join(",");
+}
+export function currentSchedule(
+  cycle: {
+    obsolete: number;
+    shopping_days_json: string;
+    starts_on: string;
+    ends_on: string;
+    shopping_on: string;
+  },
+  days: number[],
+) {
+  return (
+    !cycle.obsolete &&
+    sameShoppingDays(JSON.parse(cycle.shopping_days_json), days) &&
+    cycle.shopping_on === cycle.starts_on &&
+    cycle.ends_on === cycleEnd(cycle.starts_on, days)
+  );
+}
 export function nutrition(
   items: { ingredientId: string; amount: number }[],
   ingredients: Ingredient[],
@@ -89,13 +121,13 @@ export function allocate(
     stock.set(item.ingredientId, Math.max(0, available - item.amount));
   }
 }
-export function chooseRecipe(
+export function rankRecipes(
   recipes: Recipe[],
   stock: Map<string, number>,
   used: string[],
   settings: Settings,
   allowPurchase: boolean,
-): Recipe {
+): Recipe[] {
   const candidates = recipes
     .map((recipe) => {
       const managedItems = recipe.items.filter((i) => !i.inventory_exempt);
@@ -121,11 +153,21 @@ export function chooseRecipe(
     .sort(
       (a, b) => a.score - b.score || a.recipe.id.localeCompare(b.recipe.id),
     );
+  return candidates.map((c) => c.recipe);
+}
+export function chooseRecipe(
+  recipes: Recipe[],
+  stock: Map<string, number>,
+  used: string[],
+  settings: Settings,
+  allowPurchase: boolean,
+): Recipe {
+  const candidates = rankRecipes(recipes, stock, used, settings, allowPurchase);
   if (!candidates.length)
     throw new DomainError(
       "NO_FEASIBLE_DINNER",
       "在庫・調理時間・設備・アレルギー条件を満たす夕食がありません。在庫を補正するか、買い足しを許可し、条件を見直してください。",
       422,
     );
-  return candidates[0].recipe;
+  return candidates[0];
 }
