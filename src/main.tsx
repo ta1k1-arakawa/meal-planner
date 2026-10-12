@@ -832,7 +832,11 @@ function SettingsForm({
   save: (s: Settings & { discardPendingShopping?: boolean }) => void;
 }) {
   const [s, setS] = useState(settings);
-  useEffect(() => setS(settings), [settings]);
+  const [resetOldShopping, setResetOldShopping] = useState(false);
+  useEffect(() => {
+    setS(settings);
+    setResetOldShopping(false);
+  }, [settings]);
   const fields: [keyof Settings, string][] = [
     ["dailyKcal", "1日の目標 kcal"],
     ["dailyProtein", "1日の目標たんぱく質 g"],
@@ -850,14 +854,17 @@ function SettingsForm({
             s.shoppingDays,
             settings.shoppingDays,
           );
+          const discardPendingShopping = changed || resetOldShopping;
           if (
-            changed &&
+            discardPendingShopping &&
             !window.confirm(
-              "買い物曜日を変更します。旧曜日の未確定リストを無効化し、新曜日で不足量を再計算します。既存の献立・在庫・食事記録・確定済み購入は保持します。続けますか？",
+              changed
+                ? "買い物曜日を変更します。旧曜日の未確定リストを無効化し、新曜日で不足量を再計算します。既存の献立・在庫・食事記録・確定済み購入は保持します。続けますか？"
+                : "買い物曜日は変更せず、旧設定で作成された未確定買い物リストを整理して再計算します。既存の献立・在庫・食事記録・確定済み購入は保持します。続けますか？",
             )
           )
             return;
-          save({ ...s, discardPendingShopping: changed });
+          save({ ...s, discardPendingShopping });
         }}
       >
         {fields.map(([key, label]) => (
@@ -898,6 +905,18 @@ function SettingsForm({
               </label>
             ))}
           </div>
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={resetOldShopping}
+              onChange={(e) => setResetOldShopping(e.target.checked)}
+            />
+            古い未確定の買い物リストを整理して再計算する
+          </label>
+          <p className="muted">
+            以前に曜日だけ変更済みで古い期間のリストが残っている場合にも使えます。
+            新しい曜日を選び直す必要はありません。確認後に保存してください。
+          </p>
         </fieldset>
         <fieldset>
           <legend>使える設備</legend>
