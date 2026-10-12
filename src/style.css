@@ -1,0 +1,273 @@
+:root {
+  font-family:
+    system-ui,
+    -apple-system,
+    "Noto Sans JP",
+    sans-serif;
+  color: #25352d;
+  background: #f5f4ee;
+  line-height: 1.65;
+  font-synthesis: none;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+header {
+  max-width: 900px;
+  margin: auto;
+  padding: 30px 20px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+h1 {
+  font-size: 1.7rem;
+  margin: 0;
+}
+h2 {
+  font-size: 1.2rem;
+  margin: 10px 0;
+}
+h3 {
+  margin: 8px 0;
+}
+.eyebrow {
+  font-size: 0.7rem;
+  letter-spacing: 0.18em;
+  color: #58755f;
+  margin: 0;
+}
+nav {
+  display: flex;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #f5f4eef5;
+  max-width: 900px;
+  margin: auto;
+  padding: 8px 16px;
+  gap: 4px;
+  overflow: auto;
+  border-bottom: 1px solid #dce2d9;
+}
+nav button {
+  background: transparent;
+  color: #526759;
+  min-width: 58px;
+  padding: 9px 8px;
+  border-radius: 10px;
+}
+nav button.active {
+  background: #245b45;
+  color: white;
+}
+main {
+  max-width: 760px;
+  margin: auto;
+  padding: 20px 16px 40px;
+}
+.card {
+  background: #fff;
+  border: 1px solid #e0e5db;
+  border-radius: 16px;
+  padding: 20px;
+  margin: 16px 0;
+  box-shadow: 0 3px 14px #263e2910;
+}
+.row,
+.stock-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.badge {
+  font-size: 0.75rem;
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 20px;
+  background: #efeee8;
+}
+.planned,
+.draft {
+  background: #fcf0cd;
+  color: #705823;
+}
+.completed {
+  background: #e0efe4;
+  color: #245b45;
+}
+.skipped {
+  background: #ebebeb;
+}
+.metrics {
+  font-weight: 600;
+  color: #245b45;
+}
+button {
+  background: #245b45;
+  color: #fff;
+  border: 0;
+  border-radius: 10px;
+  min-height: 44px;
+  padding: 10px 16px;
+  font: inherit;
+  cursor: pointer;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+.secondary {
+  background: #edf1e9;
+  color: #354d3e;
+}
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+summary:focus-visible {
+  outline: 3px solid #dc983c;
+  outline-offset: 3px;
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+label {
+  display: block;
+  margin: 14px 0;
+}
+input,
+select {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 12px;
+  margin-top: 6px;
+  border: 1px solid #becbbe;
+  border-radius: 8px;
+  font: inherit;
+  background: #fff;
+  color: #25352d;
+}
+.check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0;
+}
+.check input {
+  width: 22px;
+  height: 22px;
+  min-height: 22px;
+  margin: 0;
+  accent-color: #245b45;
+}
+.muted,
+small {
+  font-size: 0.85rem;
+  color: #617466;
+}
+li {
+  margin: 7px 0;
+}
+li small {
+  display: block;
+}
+summary {
+  cursor: pointer;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  text-decoration: underline;
+}
+fieldset {
+  border: 1px solid #d6dfd1;
+  border-radius: 10px;
+  margin: 16px 0;
+}
+.weekdays {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.stock-row {
+  padding: 15px 4px;
+  border-bottom: 1px solid #dfe5da;
+}
+.stock-list {
+  background: #fff;
+  padding: 8px 16px;
+  border-radius: 14px;
+}
+.empty {
+  padding: 30px 20px;
+  border: 1px dashed #bccbb7;
+  border-radius: 12px;
+  color: #617466;
+}
+.notice,
+.error {
+  padding: 14px;
+  border-radius: 10px;
+}
+.notice {
+  background: #e0efe4;
+}
+.error {
+  background: #ffe8e3;
+  color: #8d3024;
+}
+.error button {
+  margin-left: 10px;
+}
+.generate {
+  padding: 0 4px 14px;
+}
+.review {
+  border: 2px solid #245b45;
+}
+footer {
+  margin-top: 35px;
+  text-align: center;
+  color: #617466;
+}
+.login {
+  max-width: 400px;
+  margin: 10vh auto;
+}
+.login form {
+  margin-top: 25px;
+}
+@media (max-width: 480px) {
+  header {
+    padding-top: 22px;
+  }
+  header small {
+    font-size: 0.72rem;
+  }
+  h1 {
+    font-size: 1.45rem;
+  }
+  .card {
+    padding: 16px;
+  }
+  .actions button {
+    flex: 1 1 120px;
+  }
+  nav {
+    padding: 8px;
+    gap: 0;
+    justify-content: space-between;
+  }
+  nav button {
+    min-width: 50px;
+    font-size: 0.85rem;
+  }
+}

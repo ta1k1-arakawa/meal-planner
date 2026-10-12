@@ -1,0 +1,111 @@
+# 夕食の献立帳
+
+`SPEC.md` v1.2 に沿った個人用・日本語の夕食プランナー。React / TypeScript / Vite、Cloudflare Workers / D1 を使用します。
+
+## 今回の実装
+
+- パスワード認証（署名済み HttpOnly / SameSite Cookie、12時間）と全APIの入力検証。
+- 外部キー・CHECK・UNIQUE付きのドメインスキーマ、30件の夕食レシピと食品成分の概算値。
+- g / ml の在庫、個・丁の換算、追加・減算・変更履歴。期限は扱いません。
+- 次の買い物日前日までの夕食生成。設備・アレルゲン・時間を満たす候補を、栄養目標・在庫不足・バリエーションで評価。部分的な成功は保存しません。
+- 累計の不足量、実購入量の編集・確定、再送による二重追加の防止。
+- 実使用量を編集して食事完了、スキップ、履歴。訂正は元の記録を変更せず差分在庫と訂正スナップショットを追記します。
+- 今日・献立・買い物・在庫・記録・設定のモバイル向け画面。確認済み・予定・未確認の栄養を区別。
+- 「献立」画面から30件すべてのレシピの食材名・分量・具体的な配合と手順を閲覧できます。分量は材料データから手順へ展開します。
+- 油・しょうゆ・みそ・砂糖・カレー粉は常備調味料として扱い、在庫登録・購入・実使用量入力は不要。栄養・アレルゲンには含め、完了時に既定量を自動保存します。生しょうがは通常食材です。
+
+写真認識、体重トレンド、プリセットの詳細編集、PWAのオフライン対応は後続の実装範囲です。写真認識の仮データを表示する実装はありません。昼食等の栄養入力・食事記録訂正・換算係数編集は現段階ではAPIから利用します。
+
+## ローカル起動
+
+Node.js 22以降と Python 3（レシピマイグレーション生成・整合性確認時）。依存バージョンは `package-lock.json` に固定しています。
+
+```sh
+npm ci
+cp .env.example .dev.vars
+# .dev.vars の APP_PASSWORD を32文字以上のランダムな値に変更
+npm run build
+npm run db:migrate
+npm run dev:api
+```
+
+`http://localhost:8787` を開き、設定したパスワードでログインします。DBは `.wrangler/` 内に保存されます。初期在庫はすべて0。最初に在庫を追加するか、献立画面で買い足しを許可し、買い物リストを確定してください。
+
+フロントの開発時は別ターミナルで `npm run dev` を実行し `http://localhost:5173` を開きます。Vite が `/api` をローカル Worker に転送します。
+
+マイグレーション `0002_seed.sql` は初期データを含み、`db:migrate` で一度だけ適用されます。`0001`〜`0003` は既に適用済みのファイルとして変更しません。`scripts/generate-seed.py` は現在、追加の `0004_pantry_recipe_details.sql` を生成します。`python3 scripts/generate-seed.py --check` で生成元とSQLの一致を確認できます。今後の変更はさらに新しい番号のマイグレーションにしてください。
+
+## 既存DBの更新（Issue #2）
+
+`0004` は分類フラグと量の入力元カラムを追加し、30件の手順を更新します。在庫量、在庫履歴、食事記録・訂正履歴、材料量は削除・上書きしません。既存の調味料在庫と買い物項目は保存したまま画面・業務処理から除外します。過去の食事記録は当時のスナップショットのままです。
+
+ローカルは `npm run db:migrate` で未適用の `0004` だけを追加できます。本番はこのPRではデプロイもDB更新も行いません。承認後にD1バックアップを取得し、`0004` と対応するWorker/UIを同じ更新作業で適用してください。古い画面から新たに調味料を入力するとエラーになるため、利用者は更新後に画面を再読み込みします。既存の成功済み再送キーは元の結果を返します。
+
+## 検証
+
+```sh
+npm run lint
+npm run typecheck
+npm test
+npm run build
+python3 scripts/generate-seed.py --check
+npx wrangler deploy --dry-run
+```
+
+結合テストはモックDBではなく Miniflare の D1 で実行します。ローカルの loopback ポートと workerd の起動が必要です。GitHub Actions にも同じチェックを設定しています。
+
+## スマホからの本番デプロイ（GitHub Actions）
+
+PR #1を取り込んだ `main` が対象です。通常の push / PR は検証のみで、本番更新は **Actions → Deploy production (manual) → Run workflow** を押した場合に限ります。ブランチは `main` 固定で、他のブランチの手動実行はスキップします。workflowを一覧から実行するには、まずPRをデフォルトブランチ `main` にマージしてください。この実装作業では本番への実行を行いません。
+
+実行順序は lint → 型チェック → 全テスト → レシピSQL整合性 → ビルド → Wrangler dry-run → production環境の承認（設定した場合）→ **D1全体のSQLエクスポート・暗号化・復号照合 → 暗号化バックアップの保存 → 未適用マイグレーションのみ追加 → 検証済みWorker/静的ファイルのデプロイ** です。検証と配信は同じコミット・同じビルド成果物を使用します。途中で失敗した場合、後続の更新は実行しません。同時実行は直列化し、進行中のデプロイを新しい実行で中断しません。
+
+### Cloudflare管理画面で設定・確認する項目
+
+1. **Workers & Pages → 既存Worker**: Worker名を控えます。新しいWorkerに切り替えず、現在使っている名前を指定してください。Settings → Variables and Secrets の `APP_PASSWORD` が暗号化されたSecretで、32文字以上であることを確認します。未登録の場合のみ登録してください。既存SecretはActionsから上書きしません。`VITE_` 変数やGitHubのVariableにはパスワードを入れません。
+2. **Storage & Databases → D1 → 既存meal-planner DB**: Database ID（UUID）を控えます。DBの新規作成、削除、初期化は不要です。既存Workerの `DB` bindingがこのDBを参照していること、および既存の `d1_migrations` 履歴が適用済みファイルと一致することを確認してください。履歴のない既存DBに初期マイグレーションを無理に適用しないでください。
+3. **アカウントの概要**: Account IDを控えます。WorkerとD1は同じアカウントにしてください。
+4. **プロフィール → API Tokens → Create Token → Custom token**: 対象のアカウントだけに `Account / Workers Scripts / Edit` と `Account / D1 / Edit` を許可します。この構成はWorkersの既存URLを利用し、RoutesやDNSを変更しません。Global API Keyは使いません。トークンをコピーしてGitHub Secretに登録します。失効日を設定した場合は期限前に更新します。
+5. **D1 → Time Travel**: 利用できる復旧期間を確認します（Freeは通常7日、Paidは30日）。ActionsのSQLバックアップと併用します。復旧を実行するのは障害時の別作業です。
+
+### GitHub管理画面で設定する項目
+
+リポジトリ **Settings → Environments → New environment** で `production` を作成し、次を登録します。スマホで項目が見つからない場合はブラウザの「デスクトップ用Webサイト」を使います。
+
+| 種別                 | 名前                        | 登録する値                                                               |
+| -------------------- | --------------------------- | ------------------------------------------------------------------------ |
+| Environment secret   | `CLOUDFLARE_API_TOKEN`      | 上で作成したAPIトークン                                                  |
+| Environment secret   | `D1_BACKUP_KEY`             | 32文字以上のランダムな暗号化用パスフレーズ。アプリのパスワードとは別の値 |
+| Environment variable | `CLOUDFLARE_ACCOUNT_ID`     | 既存アカウントの32桁ID                                                   |
+| Environment variable | `CLOUDFLARE_D1_DATABASE_ID` | **データが入っている既存D1**のUUID                                       |
+| Environment variable | `CLOUDFLARE_WORKER_NAME`    | **既存Worker**の名前（例: `meal-planner`）                               |
+
+`D1_BACKUP_KEY` はパスワードマネージャーにも保管してください。GitHub Secretsの値は後から表示できません。鍵を更新しても、過去のバックアップに使った鍵は保存期限が終わるまで保持します。ソースやIssue、チャットには貼り付けません。
+
+Environmentの **Deployment branches and tags → Selected branches and tags** で `main` のブランチだけを許可します。利用できるプランなら **Required reviewers** に自分を設定してデプロイ直前にも承認します。個人で承認する場合は「Prevent self-review」を有効にしません。環境承認の機能が使えなくても、workflowは手動実行のみです。
+
+**Settings → Actions → General** でGitHub公式のCheckout / Setup Node / Upload Artifact / Download Artifactを許可し、Workflow permissionsは **Read repository contents** にします。アーティファクトの保存期間は30日以上を許可してください。`main` のRuleset / Branch protectionでPR経由の変更とCIの `verify` 成功を必須にすることも推奨します。workflowとスクリプトの変更をマージ前に確認してください。
+
+### 毎回のスマホ操作
+
+1. Codex Cloudに実装を依頼し、PRの差分とCI成功をGitHubで確認して `main` にマージします。
+2. 更新中はアプリへの在庫・食事・買い物入力を止めます。GitHubブラウザ画面の **Actions → Deploy production (manual) → Run workflow → Branch: main → Run workflow** を押します。GitHubモバイルアプリでボタンが見えない場合はブラウザを使います。
+3. 設定した場合は **Review deployments → production → Approve and deploy** を押します。
+4. 実行画面でバックアップ保存・マイグレーション・配信のすべてが成功したことを確認します。Artifactsに `d1-backup-実行ID-試行番号` が残ります。暗号化ファイルのみで保存期間は30日です。長期保管が必要なら期限前にダウンロードします。
+5. アプリを再読み込みし、ログイン、既存の在庫・食事履歴、30件のレシピ表示を確認します。未ログインのAPIは401となります。PCの常時稼働は不要です。
+
+失敗した実行では、どの段階まで成功したかを確認してからCodex Cloudにログを渡します（秘密・SQL実データは貼りません）。特にマイグレーション成功後に配信が失敗した場合、DB変更は自動で元に戻りません。D1は失敗したマイグレーションをロールバックしますが、その前に成功したマイグレーションは残ります。修正後の再実行は新たなバックアップを取り、残りのマイグレーションを適用します。データを消すリセット、既存マイグレーションの書き換え、DBの再作成、無確認の復旧は行いません。追加マイグレーションは旧Workerとの互換性を保ってください。
+
+### バックアップと復旧
+
+エクスポート・暗号化・保存が失敗した場合は本番マイグレーションを開始しません。SQL全体をAES-256-GCM（ランダムsalt/IV、scrypt鍵導出）で暗号化し、復号して元ファイルと照合してからアップロードします。平文はrunnerから削除し、ログやArtifactsに含めません。設定ファイルと作業ファイルはGit管理対象外です。GitHub Actions以外からの本番更新は、このworkflowの排他制御の対象外です。
+
+障害時はまずアプリの入力を止め、バックアップ時点以降の入力が失われる影響を確認します。CloudflareのTime Travelで対象時刻を指定するか、暗号化アーティファクトをダウンロードして、Codex Cloudで保管済みの鍵を安全な環境変数 `D1_BACKUP_KEY` に設定し、次のコマンドで復号します。鍵をコマンド引数には書きません。
+
+```sh
+node scripts/backup-crypto.mjs decrypt d1.sql.enc /tmp/meal-planner-restore.sql
+```
+
+復号SQLはまず**別の復旧用D1**で検証し、アプリ・在庫・履歴・マイグレーション履歴を確認します。既存本番DBへそのままSQLを流して上書きしません。本番への切り替えやTime Travelの復元は、対象とデータ損失範囲を確認したうえで別途手動で行います。自動復旧は含めません。
+
+契約・制約は [docs/api.md](docs/api.md)、食品データの扱いは [docs/nutrition.md](docs/nutrition.md) を参照してください。
