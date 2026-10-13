@@ -92,4 +92,5 @@ export interface PhotoPurchase {
   manual_candidates: number;
   items: PhotoItem[];
   duplicate?: boolean;
+  enriched?: boolean;
 }

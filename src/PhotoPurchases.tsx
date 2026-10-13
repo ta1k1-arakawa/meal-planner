@@ -54,6 +54,7 @@ export function PhotoPurchases({
     [purchase, setPurchase] = useState<PhotoPurchase | null>(null),
     [files, setFiles] = useState<File[]>([]),
     [multi, setMulti] = useState(false),
+    [targetPurchase, setTargetPurchase] = useState<string | null>(null),
     [working, setWorking] = useState(false),
     [error, setError] = useState(""),
     [correcting, setCorrecting] = useState(false),
@@ -96,7 +97,10 @@ export function PhotoPurchases({
           if (live) {
             remember(p);
             if (p.status !== "processing") {
-              if (p.status !== "failed") setFiles([]);
+              if (p.status !== "failed") {
+                setFiles([]);
+                setTargetPurchase(null);
+              }
               void changed.current().catch(() => {});
             }
           }
@@ -120,9 +124,13 @@ export function PhotoPurchases({
       const p = await action();
       remember(p);
       setNotice(
-        p.duplicate
-          ? "同じ写真・レシートの登録履歴です。在庫は再追加していません。"
-          : "",
+        p.enriched
+          ? "追加写真から保留項目を更新しました。登録済みの量は重ねて加算していません。"
+          : p.enriched === false
+            ? "追加写真でも保留項目を確実に補完できませんでした。手動で確認できます。"
+            : p.duplicate
+              ? "同じ写真・レシートの登録履歴です。在庫は再追加していません。"
+              : "",
       );
       await changed.current();
     } catch (e) {
@@ -149,10 +157,14 @@ export function PhotoPurchases({
     if (retry) uploadKey.current = crypto.randomUUID();
     const form = new FormData();
     form.append("idempotencyKey", uploadKey.current);
+    if (targetPurchase) form.append("purchaseId", targetPurchase);
     images.forEach((f) => form.append("images", f));
     await perform(async () => {
       const result = await request<PhotoPurchase>("", form);
-      if (!["failed", "processing"].includes(result.status)) setFiles([]);
+      if (!["failed", "processing"].includes(result.status)) {
+        setFiles([]);
+        setTargetPurchase(null);
+      }
       return result;
     });
   }
@@ -241,6 +253,7 @@ export function PhotoPurchases({
         disabled={disabled || working}
         onClick={() => {
           setMulti(false);
+          setTargetPurchase(null);
           camera.current?.click();
         }}
       >
@@ -251,7 +264,10 @@ export function PhotoPurchases({
           type="button"
           className="secondary"
           disabled={disabled || working}
-          onClick={() => library.current?.click()}
+          onClick={() => {
+            if (!multi) setTargetPurchase(null);
+            library.current?.click();
+          }}
         >
           写真から選ぶ
         </button>
@@ -261,6 +277,7 @@ export function PhotoPurchases({
           disabled={disabled || working}
           onClick={() => {
             setMulti(true);
+            setTargetPurchase(null);
             setFiles([]);
           }}
         >
@@ -270,7 +287,10 @@ export function PhotoPurchases({
       {multi && (
         <div className="notice">
           <p>
-            レシートと購入品を分けて撮影できます（最大4枚）。選択済み：
+            {targetPurchase
+              ? "保留項目を補完します。同じ購入のレシートと商品ラベルを新たに撮影してください（最大4枚）。"
+              : "レシートと購入品を分けて撮影できます（最大4枚）。"}
+            選択済み：
             {files.length}枚
           </p>
           <div className="photo-actions">
@@ -297,6 +317,7 @@ export function PhotoPurchases({
               disabled={working}
               onClick={() => {
                 setMulti(false);
+                setTargetPurchase(null);
                 setFiles([]);
               }}
             >
@@ -339,6 +360,7 @@ export function PhotoPurchases({
               setPurchase(history.find((p) => p.id === e.target.value) ?? null);
               setCorrecting(false);
               setFiles([]);
+              setTargetPurchase(null);
               selectionEpoch.current++;
               setNotice("");
             }}
@@ -419,6 +441,20 @@ export function PhotoPurchases({
                     </li>
                   ))}
                 </ul>
+              )}
+              {purchase.status === "review" && pending.length > 0 && (
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={disabled || working}
+                  onClick={() => {
+                    setTargetPurchase(purchase.id);
+                    setMulti(true);
+                    setFiles([]);
+                  }}
+                >
+                  写真を追加して保留項目を解析
+                </button>
               )}
               {purchase.relation === "unknown" &&
                 purchase.status !== "undone" && (

@@ -1,11 +1,12 @@
 -- Append-only purchase evidence and new import state; never rewrite 0001-0006.
-CREATE TABLE photo_purchase_meta (id INTEGER PRIMARY KEY CHECK(id=1), hash_salt TEXT NOT NULL);
-INSERT INTO photo_purchase_meta VALUES (1,lower(hex(randomblob(32))));
+CREATE TABLE photo_purchase_meta (id INTEGER PRIMARY KEY CHECK(id=1), hash_salt TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0 CHECK(version>=0));
+INSERT INTO photo_purchase_meta(id,hash_salt) VALUES (1,lower(hex(randomblob(32))));
 CREATE TABLE photo_purchases (
  id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN ('processing','review','applied','failed','undone')),
  version INTEGER NOT NULL DEFAULT 0 CHECK(version>=0),
  receipt_hash TEXT UNIQUE, receipt_fingerprint TEXT,
  duplicate_of TEXT REFERENCES photo_purchases(id), possible_duplicate_id TEXT REFERENCES photo_purchases(id),
+ parent_purchase_id TEXT REFERENCES photo_purchases(id),
  purchase_date TEXT, linked_cycle_id TEXT, manual_candidates INTEGER NOT NULL DEFAULT 0 CHECK(manual_candidates>=0),
  relation TEXT NOT NULL DEFAULT 'unknown' CHECK(relation IN ('unknown','new','same','recorded')),
  model TEXT, error_code TEXT, image_count INTEGER NOT NULL CHECK(image_count BETWEEN 1 AND 4),

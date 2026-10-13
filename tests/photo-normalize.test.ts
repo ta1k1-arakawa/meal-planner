@@ -121,6 +121,48 @@ describe("conservative photo normalization", () => {
       normalized([item({ ingredientId: "missing-food" })])[0].ingredientId,
     ).toBeNull();
   });
+  it("holds alternate product and receipt labels of the same food instead of adding both automatically", () => {
+    const rows = normalized([item(), item({ label: "トマト200g" })]);
+    expect(rows).toHaveLength(2);
+    expect(rows.every((row) => row.status === "pending")).toBe(true);
+  });
+  it("uses explicit ×2 pack evidence and pantry flags while keeping fresh ginger managed", () => {
+    expect(
+      normalized([item({ packs: 2, countEvidence: "200g×2" })])[0].amount,
+    ).toBe(400);
+    expect(
+      normalized([item({ packs: 2, countEvidence: "12パック" })])[0].status,
+    ).toBe("pending");
+    expect(
+      normalized([item({ packs: 2, countEvidence: "1.2パック" })])[0].status,
+    ).toBe("pending");
+    const ginger = ingredient("ginger", "生姜", "raw");
+    const soy = {
+      ...ingredient("soy", "こいくちしょうゆ", "ready"),
+      inventory_exempt: 1,
+    };
+    const rows = normalizePurchaseItems(
+      {
+        receipt: null,
+        items: [
+          item({
+            label: "生姜",
+            ingredientId: "ginger",
+            category: "seasoning",
+          }),
+          item({
+            label: "減塩醤油",
+            ingredientId: "soy",
+            foodState: "ready",
+            category: "seasoning",
+          }),
+        ],
+      },
+      [ginger, soy],
+    );
+    expect(rows[0].status).toBe("applied");
+    expect(rows[1].status).toBe("ignored");
+  });
   it("creates a salted normalized identity only for valid high-confidence calendar/time evidence", async () => {
     const receipt: NonNullable<Recognition["receipt"]> = {
       merchant: "テスト店",

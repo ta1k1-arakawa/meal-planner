@@ -8,7 +8,12 @@ import {
   type PhotoPurchase,
   type PhotoItem,
 } from "./photo-contracts";
-import { normalizePurchaseItems, receiptHash } from "./photo-normalize";
+import {
+  normalized,
+  normalizePurchaseItems,
+  receiptHash,
+  type NormalizedPhotoItem,
+} from "./photo-normalize";
 import {
   requirePhotoAI,
   recognizePhotos,
@@ -19,6 +24,7 @@ import { parseUpload } from "./photo-upload";
 
 interface Root extends Omit<PhotoPurchase, "items" | "duplicate"> {
   duplicate_of: string | null;
+  parent_purchase_id: string | null;
   receipt_hash: string | null;
   receipt_fingerprint: string | null;
 }
@@ -107,7 +113,7 @@ export async function importPhotos(
   env: PhotoAIEnv,
   request: Request,
 ) {
-  const { key, images, payloadHash } = await parseUpload(request);
+  const { key, images, payloadHash, parentId } = await parseUpload(request);
   const known = await knownUpload(database, key, payloadHash);
   if (known) return { ...known, duplicate: true };
   const claims = await db.rows<{ purchase_id: string }>(
@@ -124,6 +130,28 @@ export async function importPhotos(
   const existing = claims.length
     ? await root(database, claims[0].purchase_id)
     : null;
+  if (
+    existing &&
+    parentId &&
+    existing.id !== parentId &&
+    existing.parent_purchase_id !== parentId &&
+    (await photoPurchase(database, existing.id)).id !== parentId
+  )
+    throw new DomainError(
+      "PHOTO_MIXED_PURCHASES",
+      "別の購入に使われた写真です。撮り直してください",
+      409,
+    );
+  if (
+    existing &&
+    exhausted(existing) &&
+    existing.parent_purchase_id !== parentId
+  )
+    throw new DomainError(
+      "PHOTO_RETRY_CONTEXT",
+      "再解析は同じ購入の画面から行ってください",
+      409,
+    );
   if (existing && !exhausted(existing)) {
     const ownedImages = await db.rows<{ image_hash: string }>(
       database,
@@ -167,6 +195,15 @@ export async function importPhotos(
       throw new DomainError(
         "PHOTO_RETRY_IMAGES",
         "再解析には元の写真をすべて選んでください",
+        409,
+      );
+  }
+  if (parentId) {
+    const parent = await photoPurchase(database, parentId);
+    if (parent.id !== parentId || parent.status !== "review")
+      throw new DomainError(
+        "PHOTO_CONFLICT",
+        "保留項目が変更済みです。登録履歴を確認してください",
         409,
       );
   }
@@ -223,10 +260,11 @@ export async function importPhotos(
     statements.push(
       db.stmt(
         database,
-        "INSERT INTO photo_purchases(id,status,image_count,lease_until) VALUES (?,'processing',?,?)",
+        "INSERT INTO photo_purchases(id,status,image_count,lease_until,parent_purchase_id) VALUES (?,'processing',?,?,?)",
         id,
         images.length,
         lease,
+        parentId,
       ),
       ...images.map((i) =>
         db.stmt(
@@ -265,7 +303,21 @@ export async function importPhotos(
         images[0].hash,
       )
       .first<{ purchase_id: string }>();
-    if (winner) return photoPurchase(database, winner.purchase_id, true);
+    if (winner) {
+      const winnerRoot = await root(database, winner.purchase_id);
+      if (
+        parentId &&
+        winnerRoot.id !== parentId &&
+        winnerRoot.parent_purchase_id !== parentId &&
+        (await photoPurchase(database, winnerRoot.id)).id !== parentId
+      )
+        throw new DomainError(
+          "PHOTO_MIXED_PURCHASES",
+          "別の購入に使われた写真です",
+          409,
+        );
+      return photoPurchase(database, winner.purchase_id, true);
+    }
     throw error;
   }
   const owned = await root(database, id);
@@ -300,23 +352,36 @@ export async function importPhotos(
     const purchaseDate = fingerprint
       ? recognition.receipt!.localDateTime.slice(0, 10)
       : tokyoDate();
+    if (parentId)
+      return await enrichPurchase(
+        database,
+        owned,
+        parentId,
+        normalized,
+        strong,
+        fingerprint,
+        purchaseDate,
+        usage,
+      );
     const candidateIDs = normalized.flatMap((i) =>
       i.candidateId ? [i.candidateId] : [],
     );
     const manual = await manualOverlap(database, purchaseDate, candidateIDs);
-    const potentialPhoto =
-      !fingerprint && candidateIDs.length
-        ? await db
-            .stmt(
-              database,
-              `SELECT p.id FROM photo_purchases p WHERE p.id<>? AND p.duplicate_of IS NULL AND ((p.status='processing' AND date(p.created_at,'+9 hours')=?) OR (p.status IN ('review','applied','undone') AND p.purchase_date=? AND EXISTS(SELECT 1 FROM photo_purchase_items i WHERE i.purchase_id=p.id AND i.candidate_id IN (${candidateIDs.map(() => "?").join(",")})))) ORDER BY p.created_at DESC,p.rowid DESC LIMIT 1`,
-              id,
-              purchaseDate,
-              purchaseDate,
-              ...candidateIDs,
-            )
-            .first<{ id: string }>()
-        : null;
+    const potentialPhoto = candidateIDs.length
+      ? await db
+          .stmt(
+            database,
+            `SELECT p.id FROM photo_purchases p WHERE p.id<>? AND p.duplicate_of IS NULL AND ((p.status='processing' AND ? IS NULL AND p.rowid<(SELECT rowid FROM photo_purchases WHERE id=?) AND date(p.created_at,'+9 hours')=?) OR (p.status IN ('review','applied','undone') AND (? IS NULL OR p.receipt_fingerprint IS NULL) AND p.purchase_date=? AND EXISTS(SELECT 1 FROM photo_purchase_items i WHERE i.purchase_id=p.id AND COALESCE(i.ingredient_id,i.candidate_id) IN (${candidateIDs.map(() => "?").join(",")})))) ORDER BY p.created_at DESC,p.rowid DESC LIMIT 1`,
+            id,
+            strong,
+            id,
+            purchaseDate,
+            fingerprint,
+            purchaseDate,
+            ...candidateIDs,
+          )
+          .first<{ id: string }>()
+      : null;
     const current = await db.shopping(database, tokyoDate());
     const linked =
       manual[0]?.source_id ??
@@ -380,6 +445,12 @@ export async function importPhotos(
           JSON.stringify(item.evidence),
         ),
       );
+    stage.push(
+      db.stmt(
+        database,
+        "UPDATE photo_purchase_meta SET version=version+1 WHERE id=1",
+      ),
+    );
     try {
       await db.atomic(database, stage);
     } catch (error) {
@@ -459,6 +530,201 @@ export async function importPhotos(
   }
 }
 
+async function enrichPurchase(
+  database: D1Database,
+  child: Root,
+  parentId: string,
+  observations: NormalizedPhotoItem[],
+  strong: string | null,
+  fingerprint: string | null,
+  purchaseDate: string,
+  usage: string,
+) {
+  const original = await root(database, parentId);
+  const before = await photoPurchase(database, parentId);
+  if (original.status !== "review" || before.id !== parentId)
+    throw new DomainError(
+      "PHOTO_CONFLICT",
+      "保留項目は変更済みです。履歴を確認してください",
+      409,
+    );
+  if (
+    fingerprint &&
+    ((original.receipt_fingerprint &&
+      original.receipt_fingerprint !== fingerprint) ||
+      original.purchase_date !== purchaseDate ||
+      (strong && original.receipt_hash && original.receipt_hash !== strong))
+  )
+    throw new DomainError(
+      "PHOTO_RECEIPT_MISMATCH",
+      "同じ購入の写真を選んでください。既存の在庫登録は保持しています",
+      422,
+    );
+  if (strong) {
+    const other = await db
+      .stmt(
+        database,
+        "SELECT id FROM photo_purchases WHERE receipt_hash=? AND id<>?",
+        strong,
+        parentId,
+      )
+      .first();
+    if (other)
+      throw new DomainError(
+        "PHOTO_RECEIPT_MISMATCH",
+        "別の登録のレシートです。既存の在庫は変更しません",
+        422,
+      );
+  }
+  const after = before.items.map((i) => ({ ...i }));
+  const accepted: PhotoItem[] = [];
+  for (const item of after) {
+    if (item.status !== "pending") continue;
+    const observation = observations.find(
+      (o) =>
+        normalized(o.label) === normalized(item.label) &&
+        o.status === "applied" &&
+        o.ingredientId &&
+        o.amount,
+    );
+    if (!observation) continue;
+    if (
+      after.some(
+        (other) =>
+          other.id !== item.id &&
+          ["pending", "applied"].includes(other.status) &&
+          (other.ingredient_id ?? other.candidate_id) ===
+            observation.ingredientId,
+      )
+    )
+      continue;
+    item.candidate_id = observation.candidateId;
+    item.ingredient_id = observation.ingredientId;
+    item.amount = observation.amount;
+    item.auto_eligible = 1;
+    item.confidence = observation.confidence;
+    item.evidence_json = JSON.stringify(observation.evidence);
+    item.reason = "追加写真で明示された分量を確認";
+    accepted.push(item);
+  }
+  const key = `photo-enrich-observe:${child.id}`;
+  const payload = JSON.stringify({
+    photoId: parentId,
+    observationId: child.id,
+    action: "enrich",
+    items: accepted,
+  });
+  const statements = [
+    db.guard(
+      database,
+      "EXISTS(SELECT 1 FROM photo_purchases WHERE id=? AND version=? AND status='review')",
+      parentId,
+      original.version,
+    ),
+    db.guard(
+      database,
+      "EXISTS(SELECT 1 FROM photo_purchases WHERE id=? AND version=? AND status='processing' AND lease_until=?)",
+      child.id,
+      child.version,
+      child.lease_until,
+    ),
+    db.stmt(
+      database,
+      "UPDATE photo_purchases SET duplicate_of=?,status='undone',version=version+1,model=?,usage_json=? WHERE id=?",
+      parentId,
+      PHOTO_MODEL,
+      usage,
+      child.id,
+    ),
+  ];
+  if (fingerprint)
+    statements.push(
+      db.stmt(
+        database,
+        "INSERT OR IGNORE INTO photo_receipt_claims VALUES (?,?)",
+        fingerprint,
+        parentId,
+      ),
+    );
+  statements.push(
+    db.stmt(
+      database,
+      "UPDATE photo_purchases SET receipt_hash=COALESCE(receipt_hash,?),receipt_fingerprint=COALESCE(receipt_fingerprint,?),version=version+1 WHERE id=?",
+      strong,
+      fingerprint,
+      parentId,
+    ),
+  );
+  for (const item of accepted)
+    statements.push(
+      db.stmt(
+        database,
+        "UPDATE photo_purchase_items SET candidate_id=?,ingredient_id=?,amount=?,auto_eligible=1,confidence=?,evidence_json=?,reason=? WHERE id=?",
+        item.candidate_id,
+        item.ingredient_id,
+        item.amount,
+        item.confidence,
+        item.evidence_json,
+        item.reason,
+        item.id,
+      ),
+    );
+  statements.push(
+    db.stmt(
+      database,
+      "INSERT INTO photo_purchase_audits(id,purchase_id,version,kind,before_json,after_json,idempotency_key) VALUES (?,?,?,'auto',?,?,?)",
+      crypto.randomUUID(),
+      parentId,
+      original.version + 1,
+      JSON.stringify({ relation: original.relation, items: before.items }),
+      JSON.stringify({
+        relation: original.relation,
+        items: after,
+        source: "additional_photos",
+      }),
+      key,
+    ),
+  );
+  statements.push(
+    db.stmt(
+      database,
+      "UPDATE photo_purchase_meta SET version=version+1 WHERE id=1",
+    ),
+  );
+  await db.idempotentBatch(
+    database,
+    key,
+    "purchase",
+    payload,
+    parentId,
+    statements,
+  );
+  let current = await photoPurchase(database, parentId);
+  if (accepted.length && ["new", "same"].includes(current.relation)) {
+    try {
+      current = await editPhoto(
+        database,
+        parentId,
+        {
+          version: current.version,
+          idempotencyKey: `photo-enrich-apply:${child.id}`,
+          items: accepted.map((i) => ({
+            id: i.id,
+            ingredientId: i.ingredient_id,
+            amount: i.amount!,
+          })),
+        },
+        "auto",
+      );
+    } catch (error) {
+      if (!(error instanceof DomainError) || ![409, 422].includes(error.status))
+        throw error;
+      current = await photoPurchase(database, parentId);
+    }
+  }
+  return { ...current, enriched: accepted.length > 0 };
+}
+
 type Edit = z.infer<typeof photoEditSchema>;
 export async function editPhoto(
   database: D1Database,
@@ -491,6 +757,9 @@ async function mutatePhoto(
     payload,
   );
   if (previous) return photoPurchase(database, previous);
+  const identityVersion = (await db
+    .stmt(database, "SELECT version FROM photo_purchase_meta WHERE id=1")
+    .first<{ version: number }>())!.version;
   const [p, ingredients] = await Promise.all([
     photoPurchase(database, id),
     db.ingredients(database),
@@ -512,7 +781,59 @@ async function mutatePhoto(
       "写真の内容は変更済みです。履歴を読み直してください",
       409,
     );
-  if (kind === "auto" && p.relation !== "new")
+  if (
+    kind !== "undo" &&
+    p.relation === "new" &&
+    !p.items.some((i) => i.applied_amount > 0)
+  ) {
+    const identity = await root(database, id);
+    const ids = p.items.flatMap((i) =>
+      i.candidate_id ? [i.candidate_id] : [],
+    );
+    const other = ids.length
+      ? await db
+          .stmt(
+            database,
+            `SELECT p.id FROM photo_purchases p WHERE p.id<>? AND p.duplicate_of IS NULL AND p.status IN ('review','applied','undone') AND (? IS NULL OR p.receipt_fingerprint IS NULL) AND p.purchase_date=? AND EXISTS(SELECT 1 FROM photo_purchase_items i WHERE i.purchase_id=p.id AND COALESCE(i.ingredient_id,i.candidate_id) IN (${ids.map(() => "?").join(",")})) ORDER BY p.created_at DESC,p.rowid DESC LIMIT 1`,
+            id,
+            identity.receipt_fingerprint,
+            p.purchase_date,
+            ...ids,
+          )
+          .first<{ id: string }>()
+      : null;
+    if (other) {
+      await db.atomic(database, [
+        db.guard(
+          database,
+          "(SELECT version FROM photo_purchase_meta WHERE id=1)=?",
+          identityVersion,
+        ),
+        db.guard(
+          database,
+          "EXISTS(SELECT 1 FROM photo_purchases WHERE id=? AND version=? AND status='review')",
+          id,
+          p.version,
+        ),
+        db.stmt(
+          database,
+          "UPDATE photo_purchases SET relation='unknown',possible_duplicate_id=?,version=version+1 WHERE id=?",
+          other.id,
+          id,
+        ),
+        db.stmt(
+          database,
+          "UPDATE photo_purchase_meta SET version=version+1 WHERE id=1",
+        ),
+      ]);
+      throw new DomainError(
+        "PHOTO_RELATION_CONFLICT",
+        "別の写真登録と重なります。同じ購入か確認してください",
+        409,
+      );
+    }
+  }
+  if (kind === "auto" && !["new", "same"].includes(p.relation))
     throw new DomainError(
       "PHOTO_RELATION",
       "購入履歴との関係を確認してください",
@@ -641,6 +962,10 @@ async function mutatePhoto(
           overlapping[0].source_id,
           id,
         ),
+        db.stmt(
+          database,
+          "UPDATE photo_purchase_meta SET version=version+1 WHERE id=1",
+        ),
       ]);
       throw new DomainError(
         "PHOTO_MANUAL_CONFLICT",
@@ -649,24 +974,23 @@ async function mutatePhoto(
       );
     }
   }
-  if (
-    kind !== "undo" &&
-    relation === "new" &&
-    p.manual_candidates === 0 &&
-    cycle?.status === "confirmed"
-  ) {
-    const confirmedItems = await db.cycleItems(database, cycle);
-    if (
-      body.items.some(
+  if (kind !== "undo" && relation === "new" && p.manual_candidates === 0) {
+    const pendingIDs = body.items
+      .filter(
         (edit) =>
           edit.amount > 0 &&
-          p.items.find((i) => i.id === edit.id)?.status === "pending" &&
-          confirmedItems.some(
-            (i) =>
-              i.ingredient_id === edit.ingredientId &&
-              (i.actual_amount ?? 0) > 0,
-          ),
+          edit.ingredientId &&
+          p.items.find((i) => i.id === edit.id)?.status === "pending",
       )
+      .map((edit) => edit.ingredientId!);
+    if (
+      (
+        await manualOverlap(
+          database,
+          p.purchase_date ?? tokyoDate(),
+          pendingIDs,
+        )
+      ).length
     )
       throw new DomainError(
         "PHOTO_PENDING_MANUAL_OVERLAP",
@@ -730,6 +1054,19 @@ async function mutatePhoto(
   const statements = await db.reconcileShopping(database, {
     stockDeltas: deltas,
   });
+  statements.unshift(
+    db.guard(
+      database,
+      "(SELECT version FROM photo_purchase_meta WHERE id=1)=?",
+      identityVersion,
+    ),
+  );
+  statements.push(
+    db.stmt(
+      database,
+      "UPDATE photo_purchase_meta SET version=version+1 WHERE id=1",
+    ),
+  );
   statements.push(
     db.guard(
       database,

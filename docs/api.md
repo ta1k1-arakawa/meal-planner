@@ -86,14 +86,14 @@ Cycleに `kind:"cycle"|"run"` を追加し、旧サイクルと買い物ごと�
 
 ## 写真登録（Issue #7）
 
-| ルート                          | 操作 / 本文                                                                                                                                                                    |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| POST /photo-imports             | 認証済みmultipart/form-data: idempotencyKey、images(File)×1〜4。即時解析後のPhotoPurchase（processing/review/applied/failed/undone）を返す。高信頼項目は自動で原子的に在庫追加 |
-| GET /photo-imports              | 直近20件の非重複元の履歴。画像/レシート全文は返さない                                                                                                                          |
-| GET /photo-imports/:id          | 現在の登録内容/version/各行。重複別名は元の履歴へ解決                                                                                                                          |
-| POST /photo-imports/:id/resolve | `{version,idempotencyKey,relation?:"new"\|"same"\|"recorded",items:[{id,ingredientId:null\|string,amount:int}]}`。保留行だけの部分編集。null/0は登録しない                     |
-| POST /photo-imports/:id/correct | 同形式。指定した行だけを差分訂正。未指定行を維持し、元の監査/在庫台帳は上書きしない                                                                                            |
-| POST /photo-imports/:id/undo    | `{version,idempotencyKey}`。今回の追加分全体を補償移動。使用後の不足は409で全体拒否                                                                                            |
+| ルート                          | 操作 / 本文                                                                                                                                                                                        |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| POST /photo-imports             | 認証済みmultipart/form-data: idempotencyKey、images(File)×1〜4、purchaseId?:string。即時解析後のPhotoPurchase（processing/review/applied/failed/undone）を返す。高信頼項目は自動で原子的に在庫追加 |
+| GET /photo-imports              | 直近20件の非重複元の履歴。画像/レシート全文は返さない                                                                                                                                              |
+| GET /photo-imports/:id          | 現在の登録内容/version/各行。重複別名は元の履歴へ解決                                                                                                                                              |
+| POST /photo-imports/:id/resolve | `{version,idempotencyKey,relation?:"new"\|"same"\|"recorded",items:[{id,ingredientId:null\|string,amount:int}]}`。保留行だけの部分編集。null/0は登録しない                                         |
+| POST /photo-imports/:id/correct | 同形式。指定した行だけを差分訂正。未指定行を維持し、元の監査/在庫台帳は上書きしない                                                                                                                |
+| POST /photo-imports/:id/undo    | `{version,idempotencyKey}`。今回の追加分全体を補償移動。使用後の不足は409で全体拒否                                                                                                                |
 
 撮影は高信頼登録の明示許可。確信度>=.97だけでなく既存辞書の名前/状態/明記数量/パック数を検証。Pending項目は在庫を変えない。数量は常に辞書の正準整数g/ml。個数は設定係数を解析時にスナップショットして換算し、densityや炊飯係数を作らない。常備調味料は無視する。確信度はモデルの自己申告であり実測精度ではない。
 
@@ -110,3 +110,7 @@ Photo-first: 全pending買い物リストを在庫反映後へ再計算・versio
 監査はauto/resolve/correct/undoと変更前後の全行スナップショットを追記し、UPDATE/DELETEをtriggerで禁止。operationsは既存purchase/correction kind、movementはpurchase/correction reasonを使い、stock/reconcile/credits/audit/root versionを同じD1 batchで更新する。
 
 写真先行の保留食品をリンク先の買い物リストで手動確定した後、同じ保留行を追加する操作はPHOTO_PENDING_MANUAL_OVERLAPで422。黙って再加算しない。同一購入なら保留行をnull/0で登録対象外にし、別の購入は明示的な在庫入力で扱える。未入力の保留行はクライアントから送らず、部分確認を維持する。
+
+追加写真はPOST /photo-importsのpurchaseIdへ元のreviewを指定。新規画像だけの一回の解析で、元のpendingと正規化品名が一致し高信頼になった行だけを補完する。元のapplied/ignored/undoneをAIで変更せず、食材量を推測しない。元の日時/レシート識別と矛盾する場合はPHOTO_RECEIPT_MISMATCH。補完前後も追記監査し、既登録量を再追加せず新たに確定したpendingだけを在庫へ反映。追加写真のclaims/試行/token記録も保持し、結果は元の購入ID/enriched:trueへ解決する。失敗した追加解析は元の購入の在庫を変えない。
+
+購入識別のread→stock snapshot間に別の写真/手動確定が入る競合も、photo_purchase_meta.versionを共有してCAS。写真のstage/補完/在庫変更と手動購入確定でversionを進め、古い識別根拠で在庫を追加させない。新しい番号付きレシートでも、既存の番号未読写真と食品が重なれば例外確認する。

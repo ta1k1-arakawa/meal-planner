@@ -76,9 +76,9 @@ function quantity(item: RecognizedItem, ingredient: Ingredient) {
     return null;
   if (
     item.packs > 1 &&
-    !new RegExp(`(?:^|[^\\d])${item.packs}(?:パック|袋|点|個|丁|x|×)`).test(
-      normalized(item.countEvidence),
-    )
+    !new RegExp(
+      `(?:^|[^\\d.+-])${item.packs}(?:パック|袋|点|個|丁|x|×)|[x×*]${item.packs}(?![\\d.])`,
+    ).test(normalized(item.countEvidence))
   )
     return null;
   let factor = 1,
@@ -114,6 +114,18 @@ export function normalizePurchaseItems(
   result: Recognition,
   ingredients: Ingredient[],
 ): NormalizedPhotoItem[] {
+  const knownIDs = result.items.flatMap((item) => {
+    const ingredient = ingredients.find((i) => i.id === item.ingredientId);
+    return ingredient &&
+      !ingredient.inventory_exempt &&
+      matchesName(item.label, ingredient) &&
+      item.foodState === ingredient.state
+      ? [ingredient.id]
+      : [];
+  });
+  const repeatedFoods = new Set(
+    knownIDs.filter((id, index) => knownIDs.indexOf(id) !== index),
+  );
   const duplicates = new Set(
     result.items
       .filter(
@@ -134,15 +146,23 @@ export function normalizePurchaseItems(
     })
     .map((item) => {
       const ingredient = ingredients.find((i) => i.id === item.ingredientId);
+      // A lexical candidate can help duplicate checks; it never grants stock approval
+      // when the model supplied an unknown/null catalog ID.
+      const lexicalCandidates = ingredient
+        ? []
+        : ingredients.filter((i) => matchesName(item.label, i));
       const amount = ingredient ? quantity(item, ingredient) : null;
       const matched = !!ingredient && matchesName(item.label, ingredient);
       const rawRice = /精米|無洗米|玄米|もち米|生米/.test(item.label);
+      const foodCategory =
+        item.category === "food" ||
+        (item.category === "seasoning" && ingredient?.inventory_exempt === 0);
       const safeFood =
         !!ingredient &&
         matched &&
         !rawRice &&
         item.foodState === ingredient.state &&
-        item.category === "food" &&
+        foodCategory &&
         item.confidence >= 0.97 &&
         item.matchConfidence >= 0.97 &&
         !duplicates.has(normalized(item.label));
@@ -150,13 +170,19 @@ export function normalizePurchaseItems(
         reason = "食品を確認してください";
       if (duplicates.has(normalized(item.label)))
         reason = "同じ品名の複数行があり、数量の確認が必要です";
+      else if (ingredient && repeatedFoods.has(ingredient.id))
+        reason =
+          "同じ食材の複数行があります。商品とレシートの二重読み取りか、別の商品か確認してください";
       else if (item.category === "nonfood" && item.confidence >= 0.97) {
         status = "ignored";
         reason = "食品以外のため在庫には登録しません";
       } else if (
         ingredient?.inventory_exempt === 1 &&
-        matched &&
-        item.matchConfidence >= 0.97
+        item.matchConfidence >= 0.97 &&
+        (matched ||
+          (item.category === "seasoning" &&
+            item.confidence >= 0.97 &&
+            item.foodState === ingredient.state))
       ) {
         status = "ignored";
         reason = "常備調味料のため在庫登録は不要です";
@@ -166,7 +192,7 @@ export function normalizePurchaseItems(
         reason =
           "食品の状態が異なるか不明です。生米を炊飯済みご飯には加算しません";
       else if (!amount) reason = "表示された重量・個数・換算を確認してください";
-      else if (item.confidence < 0.97 || item.category !== "food")
+      else if (item.confidence < 0.97 || !foodCategory)
         reason = "画像だけでは確実に判断できません";
       else {
         status = "applied";
@@ -177,7 +203,9 @@ export function normalizePurchaseItems(
       }
       return {
         label: item.label,
-        candidateId: ingredient?.id ?? null,
+        candidateId:
+          ingredient?.id ??
+          (lexicalCandidates.length === 1 ? lexicalCandidates[0].id : null),
         ingredientId: safeFood ? ingredient!.id : null,
         amount:
           matched && !rawRice && item.foodState === ingredient?.state

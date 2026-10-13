@@ -1997,8 +1997,10 @@ function upload(
   photos = [testPhoto()],
   auth = true,
   origin?: string,
+  parentId?: string,
 ) {
   const form = new FormData();
+  if (parentId) form.append("purchaseId", parentId);
   form.append("idempotencyKey", key);
   photos.forEach((p) => form.append("images", p));
   return app.request(
@@ -2795,5 +2797,181 @@ describe("Issue #7 uncertain photo rows after manual fallback", () => {
     });
     expect(await quantityOf("rice")).toBe(100);
     expect(await quantityOf("tofu")).toBe(400);
+  });
+});
+
+describe("Issue #7 additional photos for pending evidence", () => {
+  it("automatically fills a pending quantity with new photos without re-adding previously accepted foods", async () => {
+    const spy = provider(
+      recognition([
+        recognized(),
+        recognized({
+          label: "トマト",
+          ingredientId: "tomato",
+          foodState: "raw",
+          amount: null,
+          unit: null,
+          packs: null,
+          quantityEvidence: "",
+        }),
+      ]),
+    );
+    const p = await imported();
+    expect(p.status).toBe("review");
+    expect(await quantityOf("tofu")).toBe(400);
+    spy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              finishReason: "STOP",
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify(
+                      recognition([
+                        recognized(),
+                        recognized({
+                          label: "トマト",
+                          ingredientId: "tomato",
+                          foodState: "raw",
+                          amount: 300,
+                          packs: 1,
+                          quantityEvidence: "300g",
+                        }),
+                      ]),
+                    ),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      ),
+    );
+    const response = await upload(
+      "clarify-pending-photo-key",
+      [testPhoto(2), testPhoto(3)],
+      true,
+      undefined,
+      p.id,
+    );
+    expect(response.status).toBe(200);
+    const completed = (await response.json()) as PhotoPurchase;
+    expect(completed.id).toBe(p.id);
+    expect(completed.enriched).toBe(true);
+    expect(completed.status).toBe("applied");
+    expect(await quantityOf("tofu")).toBe(400);
+    expect(await quantityOf("tomato")).toBe(300);
+    await upload(
+      "clarify-pending-photo-key",
+      [testPhoto(2), testPhoto(3)],
+      true,
+      undefined,
+      p.id,
+    );
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(await quantityOf("tomato")).toBe(300);
+    const undo = await post<PhotoPurchase>(`/photo-imports/${p.id}/undo`, {
+      version: completed.version,
+      idempotencyKey: "undo-additional-photos-key",
+    });
+    expect(undo.status).toBe("undone");
+    expect(await quantityOf("tofu")).toBe(0);
+    expect(await quantityOf("tomato")).toBe(0);
+  });
+  it("rejects a different receipt during clarification and preserves the original stock and pending row", async () => {
+    const spy = provider(
+      recognition([
+        recognized(),
+        recognized({
+          label: "トマト",
+          ingredientId: "tomato",
+          foodState: "raw",
+          amount: null,
+          unit: null,
+          packs: null,
+          quantityEvidence: "",
+        }),
+      ]),
+    );
+    const p = await imported();
+    spy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              finishReason: "STOP",
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify(
+                      recognition(undefined, "different-receipt"),
+                    ),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      ),
+    );
+    const r = await upload(
+      "wrong-additional-receipt",
+      [testPhoto(2)],
+      true,
+      undefined,
+      p.id,
+    );
+    const failed = (await r.json()) as PhotoPurchase;
+    expect(failed.status).toBe("failed");
+    expect(failed.error_code).toBe("PHOTO_RECEIPT_MISMATCH");
+    expect(await quantityOf("tofu")).toBe(400);
+    expect(await quantityOf("tomato")).toBe(0);
+    expect(
+      (await get<PhotoPurchase>(`/photo-imports/${p.id}`)).items.filter(
+        (i) => i.status === "pending",
+      ),
+    ).toHaveLength(1);
+  });
+  it("holds a receipt-enabled second photo when the first purchase had no receipt identity", async () => {
+    const spy = provider({ receipt: null, items: [recognized()] });
+    const first = await imported();
+    spy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              finishReason: "STOP",
+              content: { parts: [{ text: JSON.stringify(recognition()) }] },
+            },
+          ],
+        }),
+      ),
+    );
+    const second = await imported("later-readable-receipt", [testPhoto(2)]);
+    expect(second.relation).toBe("unknown");
+    expect(second.possible_duplicate_id).toBe(first.id);
+    expect(await quantityOf("tofu")).toBe(400);
+  });
+});
+
+describe("Issue #7 ambiguous parallel photo purchases", () => {
+  it("does not add two purchases of overlapping foods concurrently when neither photo has receipt identity", async () => {
+    provider({ receipt: null, items: [recognized()] });
+    await Promise.all([
+      imported("parallel-no-receipt-one", [testPhoto(1)]),
+      imported("parallel-no-receipt-two", [testPhoto(2)]),
+    ]);
+    expect([0, 400]).toContain(await quantityOf("tofu"));
+    const saved = await get<PhotoPurchase[]>("/photo-imports");
+    expect(saved.some((p) => p.status === "review")).toBe(true);
+    expect(
+      (await database
+        .prepare(
+          "SELECT count(*) AS n FROM inventory_movements WHERE reason='purchase'",
+        )
+        .first<{ n: number }>())!.n,
+    ).toBeLessThanOrEqual(1);
   });
 });

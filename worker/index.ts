@@ -560,6 +560,10 @@ app.post("/api/shopping/:id/confirm", async (c) => {
     stockDeltas: new Map(b.items.map((i) => [i.ingredientId, i.amount])),
   });
   const statements = [
+    db.stmt(
+      c.env.DB,
+      "UPDATE photo_purchase_meta SET version=version+1 WHERE id=1",
+    ),
     ...projections,
     db.guard(
       c.env.DB,

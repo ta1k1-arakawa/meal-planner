@@ -274,6 +274,61 @@ describe("photo shopping interactions", () => {
       ).items,
     ).toEqual([{ id: "quantity-row", ingredientId: "tomato", amount: 300 }]);
   });
+  it("attaches newly taken photos to the current purchase to fill only its pending rows", async () => {
+    next = result({
+      status: "review",
+      items: [
+        row(),
+        row({
+          id: "pending-tomato",
+          label: "トマト",
+          candidate_id: "tomato",
+          ingredient_id: "tomato",
+          amount: null,
+          applied_amount: 0,
+          auto_eligible: 0,
+          status: "pending",
+          reason: "数量不明",
+        }),
+      ],
+    });
+    mount();
+    await shoot();
+    fireEvent.click(
+      screen.getByRole("button", { name: "写真を追加して保留項目を解析" }),
+    );
+    fireEvent.change(screen.getByLabelText("追加の購入品を撮影"), {
+      target: { files: [photo()] },
+    });
+    await waitFor(() => expect(screen.getByText(/選択済み：1枚/)).toBeTruthy());
+    next = result({
+      enriched: true,
+      version: 4,
+      items: [
+        row(),
+        row({
+          id: "pending-tomato",
+          label: "トマト",
+          candidate_id: "tomato",
+          ingredient_id: "tomato",
+          amount: 300,
+          applied_amount: 300,
+        }),
+      ],
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "まとめて解析して登録" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByText(/追加写真から保留項目を更新/)).toBeTruthy(),
+    );
+    const uploads = calls
+      .filter((c) => c.body instanceof FormData)
+      .map((c) => c.body as FormData);
+    expect(uploads).toHaveLength(2);
+    expect(uploads[1].get("purchaseId")).toBe("photo-1");
+    expect(screen.getByText(/トマト：\+300g/)).toBeTruthy();
+  });
   it("shows connection failure with manual fallback and retries a lost response with the same key", async () => {
     fail = true;
     mount();

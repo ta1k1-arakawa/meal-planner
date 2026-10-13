@@ -93,7 +93,11 @@ export async function parseUpload(request: Request) {
       422,
     );
   }
-  if ([...form.keys()].some((k) => k !== "images" && k !== "idempotencyKey"))
+  if (
+    [...form.keys()].some(
+      (k) => k !== "images" && k !== "idempotencyKey" && k !== "purchaseId",
+    )
+  )
     throw new DomainError(
       "PHOTO_INVALID",
       "写真の送信形式を確認してください",
@@ -102,6 +106,15 @@ export async function parseUpload(request: Request) {
   if (form.getAll("idempotencyKey").length !== 1)
     throw new DomainError("PHOTO_INVALID", "再送キーが必要です", 422);
   const key = keySchema.parse(form.get("idempotencyKey"));
+  if (form.getAll("purchaseId").length > 1)
+    throw new DomainError(
+      "PHOTO_INVALID",
+      "購入IDを一つだけ指定してください",
+      422,
+    );
+  const parentId = form.has("purchaseId")
+    ? keySchema.parse(form.get("purchaseId"))
+    : null;
   const files = form.getAll("images");
   if (files.length < 1 || files.length > 4)
     throw new DomainError("PHOTO_COUNT", "写真は1〜4枚にしてください", 422);
@@ -139,7 +152,10 @@ export async function parseUpload(request: Request) {
   }
   return {
     key,
+    parentId,
     images,
-    payloadHash: await digest(JSON.stringify(images.map((i) => i.hash).sort())),
+    payloadHash: await digest(
+      JSON.stringify({ parentId, images: images.map((i) => i.hash).sort() }),
+    ),
   };
 }
