@@ -297,3 +297,29 @@ footer {
     font-size: 0.85rem;
   }
 }
+.photo-purchases {
+  border-color: #8da996;
+}
+.photo-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+.photo-actions button {
+  flex: 1 1 140px;
+}
+.photo-row {
+  border-top: 1px solid #dce2d9;
+  padding: 8px 0;
+}
+.photo-result {
+  overflow-wrap: anywhere;
+}
+.photo-result select {
+  max-width: 100%;
+}
+/* Author input styles must not override the camera inputs' native hidden state. */
+input[type="file"][hidden] {
+  display: none;
+}

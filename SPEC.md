@@ -1,4 +1,4 @@
-# Dinner Planner — Product / Technical Specification v1.4
+# Dinner Planner — Product / Technical Specification v1.5
 
 ## Scope and operating assumptions
 
@@ -26,7 +26,7 @@ All 30 initial recipes show named foods, exact canonical quantities, seasoning m
 
 ## Shopping lifecycle
 
-`shopping_cycles`: date range, scheduled shopping date, status. `shopping_items`: planned need, proposed purchase, actual purchase, unit, review/confirmed status. On purchase confirmation, perform atomic stock increase + movement writes. Use an idempotency token to avoid double additions. Some purchases can be omitted or quantity-edited. Do not assume photo-extracted amount has been purchased until confirmed.
+`shopping_cycles`: date range, scheduled shopping date, status. `shopping_items`: planned need, proposed purchase, actual purchase, unit, review/confirmed status. On purchase confirmation, perform atomic stock increase + movement writes. Use an idempotency token to avoid double additions. Some purchases can be omitted or quantity-edited. Under Issue #7, photo upload authorizes automatic purchase recording only for server-validated high-confidence observations; uncertain items and ambiguous purchase identity require explicit resolution.
 
 ## Shopping schedule changes and recipe selection (Issue #4)
 
@@ -48,7 +48,15 @@ Add migration 0006 to create shopping_runs and shopping_run_items with FK/CHECK/
 
 ## Photo recognition
 
-Entry point: camera or library, multiple image types (goods, readable package labels, receipt). Server-side adapter interface for vision model to emit structured JSON with canonical name candidate, quantity, unit, raw text, estimated/confidence flags and unresolved items. No precise weights inferred from ambiguous objects alone. Match product to ingredients; require user review of all rows. Store recognition metadata, not raw images by default; ephemeral upload handling. Rate limit and size-limit requests, allow full manual fallback, maintain cost visibility. Confirm changes to inventory only via purchase confirmation or explicit stock addition; photo confirmation and shopping confirmation must not result in double addition.
+Issue #7 supersedes the old confirm-all photo requirement. Camera/library support 1–4 images as one purchase; default one-photo capture starts recognition and inventory registration directly. Gemini 2.5 Flash Paid Tier is the user-selected provider; real calls require server-only GEMINI_API_KEY, GEMINI_PAID_TIER=true and PHOTO_AI_ENABLED=true. Never enable paid services or production changes during implementation. No fabricated recognition or client keys.
+
+Require confidence/match/quantity >=0.97 plus whole known ingredient names, exact food state, explicit label quantity evidence and verified pack multiplicity. Confidence is uncalibrated model self-assessment, not measured accuracy. Do not invent weight, density, unknown ingredient IDs or cooked/raw conversions. Count conversions use configured integer factors, snapshot their basis, and label resulting weight approximate. Seasonings remain inventory-exempt but in recipe nutrition. Pending/unrecognized foods require only exception review; all results remain visible/editable with whole Undo.
+
+Migration 0007 creates photo purchase roots/items, request/image/receipt identity claims, manual-purchase credits, immutable audits and attempt counters; it changes no 0001–0006 table or row. Exact images and numbered high-confidence receipts are unique. Shop/time/total without a number is weaker identity and prompts on collision instead of silently discarding a genuine second purchase. Claim images before an AI call, use leases/CAS and require explicit fresh-key retry after failed/expired processing. Never resend billable analysis in background. Images/full receipts are not stored; retain salted receipt identifiers, product labels, quantity/conversion evidence, model/token counts and stock audits only.
+
+Photo additions, compensating corrections/Undo, credits and shopping reconciliation use one guarded D1 batch with the existing operations/movement ledger. Negative stock blocks the entire Undo. Preserve consumed meal snapshots and confirmed manual purchase rows. Photo-first registration refreshes deficits and bumps pending list versions; manual confirmation inputs mean remaining/unregistered quantities, with amountPolicy=remaining required when photo credits exist. Manual-first matching foods on the receipt date prompts recorded/new/same purchase; same subtracts the already-recorded manual portion and adds only excess (one identifiable manual purchase required). If no purchase identity can be established, ask rather than invent it.
+
+Bound authenticated multipart input to 6MiB total, JPEG/PNG 1.5MiB/image, max dimension3072 and area6Mpx. Browser strips metadata and compresses long side to2048. AI timeout40s, output8192tokens, processing lease120s, UTC daily5/monthly60 attempts including failures. These are call-count caps, not a provider monetary cap. Provider billing/quota controls remain necessary. Preserve manual fallback when unconfigured, unreadable, rate-limited or offline. Provider comparison, costs, activation and real-image evaluation limitations are documented in README/docs/photo-purchase-design.md.
 
 ## Meal completion transaction
 
@@ -66,7 +74,7 @@ Deployed migrations `0001`–`0003` are immutable. Apply classification, amount-
 - `meal_plans(id,local_date,status,version,...)`; `meal_plan_dishes(id,plan_id,recipe_id,servings,...)`
 - `meal_logs(id,plan_id,completed_at,total_kcal,total_protein_g,idempotency_key,...)`; `meal_log_items(id,log_id,ingredient_id,amount,unit,kcal,protein_g,amount_source,...)`
 - `shopping_cycles(id,starts_on,ends_on,shopping_on,status,...)`; `shopping_items(id,cycle_id,ingredient_id,requested_amount,actual_amount,unit,status,...)`
-- `photo_imports(id,status,created_at,model,...)`; `photo_import_items(id,import_id,ingredient_candidate,amount,unit,estimate_flag,raw_label,...)`
+- `photo_purchases`, `photo_purchase_items`, `photo_purchase_requests`, `photo_purchase_images`, `photo_receipt_claims`, `photo_purchase_credits`, `photo_purchase_audits`, `photo_analysis_attempts`, `photo_purchase_meta` (see additive 0007)
 - `food_presets(id,kind,label,nutrients,quantity,enabled_by_default,...)`; `daily_food_entries(id,local_date,meal_type,preset_id,source,status,kcal,protein_g,...)`
 - `body_weight_logs(id,local_date,weight_kg,...)`; `app_settings(id,timezone,targets,shopping_days,max_minutes,preferences,...)`
   Exact SQL schema, FKs, nullability, indexes and migrations to be designed and tested by implementation agent. For integrity use explicit keys, UNIQUE(plan_id) on completed logs and compare-and-swap/version guards for plan changes.

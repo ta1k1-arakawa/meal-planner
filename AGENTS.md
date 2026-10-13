@@ -16,7 +16,7 @@ Build a private, mobile-first Japanese-language web app for one person that auto
 - Shopping: **any day**, with two configurable recommended cycle weekdays; generate all dinners until the next shopping day, taking planned consumption into account.
 - **No expiration / best-before date tracking or prioritization.** This is a product scope choice, not a statement that food cannot spoil.
 - Pantry seasonings (`inventory_exempt=1`; initially oil/soy/miso/sugar/curry) require no stock, purchase or actual-amount input. Fresh ginger remains managed. Keep every seasoning in ingredient display, nutrition and allergen checks.
-- Photo import: support photographing products/labels/receipts; infer items and approximate quantities, clearly tag estimates and require human confirmation before inventory mutation.
+- Photo import: support photographing products/labels/receipts; use Gemini Flash Paid Tier after explicit provider/configuration authorization. The user’s Issue #7 overrides the former confirm-all rule: photographing authorizes automatic registration of high-confidence, exact-state, visibly quantified catalog items. Ask only about uncertain items or ambiguous purchase identity; label configured weight conversions as approximate.
 - Prefer locally maintainable and low-cost architecture. Initial deployment target: Cloudflare Workers + D1 + React/TypeScript + Vite PWA. Private authentication required.
 
 ## Engineering workflow
@@ -33,7 +33,7 @@ Build a private, mobile-first Japanese-language web app for one person that auto
 ## Invariants — critical
 
 - **Plans are projections, not actual consumption.** Creating/editing a meal plan must not decrement actual stock.
-- **Only confirmed shopping or an explicit stock adjustment increases stock.** AI photo recognition never updates inventory without user confirmation.
+- **Only explicit shopping, stock adjustment or a photo-upload action increases stock.** Photo uploads authorize high-confidence observations validated against the catalog/state/visible quantities; uncertain observations never mutate stock until resolved. Photo and manual purchase confirmations share the ledger and reconcile remaining quantities, with duplicate identity checks.
 - **Only a successful, confirmed meal completion (or explicit correction) consumes stock.** Record actual ingredient amounts and nutrition as immutable snapshots for historical accuracy.
 - Stock update, stock movement entries, meal log, and plan status change must be **atomic**. Use D1-compatible transactional statements / `batch()` and guard concurrent updates.
 - Completion must be **idempotent**: each meal plan can be completed once; retry with the same idempotency key yields the same result without subtracting again. Conflicting completion attempts must fail safely.
@@ -71,7 +71,7 @@ Build a private, mobile-first Japanese-language web app for one person that auto
 
 ## UI rules
 
-Mobile-first Japanese interface with screens: 今日, 献立, 買い物, 在庫, レシピ; 設定 via a labelled gear. Hide past plans using the Tokyo date, keep all historical records and APIs, and show candidates inside their own card. Core actions should take few taps. Before stock-consuming actions show the amount and allow changes. Photo recognition must use an editable review table with confidence/estimate indicators. Show kcal, protein, cooking time, ingredients, cooking steps, and available vs missing materials. Meet accessible button targets and keyboard semantics.
+Mobile-first Japanese interface with screens: 今日, 献立, 買い物, 在庫, レシピ; 設定 via a labelled gear. Hide past plans using the Tokyo date, keep all historical records and APIs, and show candidates inside their own card. Core actions should take few taps. Before stock-consuming actions show the amount and allow changes. Photo recognition automatically registers safe observations, shows the result and Undo, and asks for edits only on uncertain rows. Include confidence and configured-conversion indicators. Show kcal, protein, cooking time, ingredients, cooking steps, and available vs missing materials. Meet accessible button targets and keyboard semantics.
 
 ## Testing acceptance checklist
 
@@ -82,7 +82,7 @@ Mobile-first Japanese interface with screens: 今日, 献立, 買い物, 在庫,
 - Modify actual grams at completion; stored nutrition and deduction reflect actual amounts.
 - Skip dinner; no stock change and subsequent projected plans can be rebuilt.
 - Change recipe after previous dinners completed; historical log stays unchanged.
-- Upload photo -> recognize as _unverified_ -> edit quantities -> confirm -> only then update stock.
+- Upload photo -> safe observations auto-register once; uncertain quantities/state/identity remain pending -> resolve exceptions only. Verify corrections/Undo, exact-photo and receipt duplication, concurrent/manual purchase ordering, failed/late retries and cost caps.
 - Breakfast none vs mochi, nighttime shake default vs override; distinguish projections from confirmed food intake.
 - Invalid inputs, nonauthenticated requests, upload errors and network retries handled clearly.
 - With seasoning stock zero, managed foods alone permit generation/completion. No seasonings appear in purchase or amount-entry forms; oil's kcal and soy's allergens still count.

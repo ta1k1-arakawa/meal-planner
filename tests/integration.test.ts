@@ -20,6 +20,11 @@ import {
 } from "../worker/db";
 import { eligible, nutrition } from "../worker/planner";
 import type { RecipeItem } from "../worker/contracts";
+import type {
+  PhotoPurchase,
+  Recognition,
+  RecognizedItem,
+} from "../worker/photo-contracts";
 import app, { type Env } from "../worker/index";
 import { tokyoDate, cycleEnd, addDays } from "../worker/planner";
 import type {
@@ -86,7 +91,7 @@ beforeAll(async () => {
   mf = new Miniflare({
     modules: true,
     script: 'export default {fetch(){return new Response("test")}}',
-    d1Databases: Array.from({ length: 60 }, (_, i) => "DB_" + i),
+    d1Databases: Array.from({ length: 90 }, (_, i) => "DB_" + i),
     compatibilityDate: "2026-08-01",
   });
   database = (await mf.getD1Database("DB_0")) as unknown as D1Database;
@@ -112,6 +117,9 @@ beforeEach(async (context) => {
     "DB_" + databaseIndex++,
   )) as unknown as D1Database;
   env.DB = database;
+  env.PHOTO_AI_ENABLED = undefined;
+  env.GEMINI_PAID_TIER = undefined;
+  env.GEMINI_API_KEY = undefined;
   for (const file of [
     "0001_schema.sql",
     "0002_seed.sql",
@@ -119,11 +127,18 @@ beforeEach(async (context) => {
     "0004_pantry_recipe_details.sql",
     "0005_shopping_schedule_candidates.sql",
     "0006_anytime_shopping.sql",
+    "0007_photo_purchases.sql",
   ]) {
+    if (
+      file.startsWith("0007") &&
+      context.task.name.startsWith("preserves populated 0006")
+    )
+      continue;
     if (
       (file.startsWith("0004") ||
         file.startsWith("0005") ||
-        file.startsWith("0006")) &&
+        file.startsWith("0006") ||
+        file.startsWith("0007")) &&
       context.task.name.startsWith("upgrades populated")
     )
       continue;
@@ -1082,6 +1097,7 @@ describe("pantry classification and recipe detail acceptance", () => {
           .all()
       ).results;
     await applyMigration("0006_anytime_shopping.sql");
+    await applyMigration("0007_photo_purchases.sql");
     for (const table of tables)
       expect(
         (
@@ -1188,7 +1204,10 @@ async function atDate(date: string) {
   );
   cookie = login.headers.get("set-cookie")!.split(";")[0];
 }
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 async function purchaseBody(cycle: Cycle) {
   return {
     version: cycle.version,
@@ -1900,5 +1919,881 @@ describe("Issue #6 anytime shopping", () => {
           .all()
       ).results,
     ).toHaveLength(1);
+  });
+});
+
+// Test-only provider fixtures. No real image service or paid API is used in tests.
+function recognized(overrides: Partial<RecognizedItem> = {}): RecognizedItem {
+  return {
+    label: "木綿豆腐",
+    ingredientId: "tofu",
+    foodState: "ready",
+    category: "food",
+    amount: 200,
+    unit: "g",
+    packs: 2,
+    quantityEvidence: "200g",
+    countEvidence: "2パック",
+    confidence: 0.99,
+    matchConfidence: 0.99,
+    quantityConfidence: 0.99,
+    ...overrides,
+  };
+}
+function recognition(
+  items: RecognizedItem[] = [recognized()],
+  receiptNumber: string | null = "1234",
+): Recognition {
+  return {
+    receipt: {
+      merchant: "テスト店",
+      localDateTime: tokyoDate() + "T12:30:00",
+      total: 1234,
+      currency: "JPY",
+      receiptNumber,
+      confidence: 0.99,
+    },
+    items,
+  };
+}
+function provider(result: Recognition = recognition()) {
+  env.PHOTO_AI_ENABLED = "true";
+  env.GEMINI_PAID_TIER = "true";
+  env.GEMINI_API_KEY = "test-only-not-a-real-api-key";
+  return vi.spyOn(globalThis, "fetch").mockImplementation(
+    async () =>
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              finishReason: "STOP",
+              content: { parts: [{ text: JSON.stringify(result) }] },
+            },
+          ],
+          usageMetadata: {
+            promptTokenCount: 100,
+            candidatesTokenCount: 80,
+            totalTokenCount: 180,
+          },
+        }),
+        { headers: { "Content-Type": "application/json" } },
+      ),
+  );
+}
+function testPhoto(n = 0) {
+  // Valid 1px PNG with optional trailing bytes: different viewpoints use different exact hashes.
+  const bytes = Uint8Array.from(
+    Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jVZkAAAAASUVORK5CYII=",
+      "base64",
+    ),
+  );
+  return new File([bytes, new Uint8Array([n])], "test-only.png", {
+    type: "image/png",
+  });
+}
+function upload(
+  key: string = crypto.randomUUID(),
+  photos = [testPhoto()],
+  auth = true,
+  origin?: string,
+) {
+  const form = new FormData();
+  form.append("idempotencyKey", key);
+  photos.forEach((p) => form.append("images", p));
+  return app.request(
+    "https://dinner.test/api/photo-imports",
+    {
+      method: "POST",
+      headers: {
+        ...(auth ? { Cookie: cookie } : {}),
+        ...(origin ? { Origin: origin } : {}),
+      },
+      body: form,
+    },
+    env,
+  );
+}
+async function imported(
+  key: string = crypto.randomUUID(),
+  photos = [testPhoto()],
+) {
+  const r = await upload(key, photos);
+  expect(r.status, await r.clone().text()).toBe(200);
+  return r.json() as Promise<PhotoPurchase>;
+}
+async function quantityOf(id: string) {
+  return (await get<Stock[]>("/inventory")).find((i) => i.id === id)!.quantity;
+}
+
+async function planTofu() {
+  await database.batch([
+    database
+      .prepare(
+        "INSERT INTO meal_plans(id,local_date,status) VALUES ('photo-tofu-plan',?,'planned')",
+      )
+      .bind(tokyoDate()),
+    database.prepare(
+      "INSERT INTO meal_plan_dishes VALUES ('photo-tofu-dish','photo-tofu-plan','tofu-ginger',1)",
+    ),
+  ]);
+}
+
+describe("Issue #7 authenticated photo purchase ledger", () => {
+  it("automatically registers explicit weights/counts without a confirm-all action, omitting seasonings", async () => {
+    const spy = provider(
+      recognition([
+        recognized(),
+        recognized({
+          label: "鶏卵",
+          ingredientId: "egg",
+          foodState: "raw",
+          amount: 10,
+          unit: "count",
+          packs: 1,
+          quantityEvidence: "10個",
+          countEvidence: "1パック",
+        }),
+        recognized({
+          label: "しょうが",
+          ingredientId: "ginger",
+          foodState: "raw",
+          amount: 0.1,
+          unit: "kg",
+          packs: 1,
+          quantityEvidence: "0.1kg",
+        }),
+        recognized({
+          label: "しょうゆ",
+          ingredientId: "soy",
+          category: "seasoning",
+          amount: 500,
+          unit: "ml",
+          packs: 1,
+          quantityEvidence: "500ml",
+        }),
+      ]),
+    );
+    const p = await imported();
+    expect(p.status).toBe("applied");
+    expect(await quantityOf("tofu")).toBe(400);
+    expect(await quantityOf("egg")).toBe(500);
+    expect(await quantityOf("ginger")).toBe(100);
+    expect(p.items.find((i) => i.candidate_id === "soy")?.status).toBe(
+      "ignored",
+    );
+    const call = spy.mock.calls[0];
+    expect(String(call[0])).not.toContain(env.GEMINI_API_KEY);
+    expect(call[1]?.headers).toEqual(
+      expect.objectContaining({
+        "x-goog-api-key": "test-only-not-a-real-api-key",
+      }),
+    );
+    expect(JSON.stringify(p)).not.toMatch(
+      /hash_salt|receipt_hash|merchant|test-only-not-a-real/,
+    );
+    expect(
+      (
+        await database
+          .prepare("SELECT count(*) AS n FROM photo_purchase_audits")
+          .first<{ n: number }>()
+      )?.n,
+    ).toBe(1);
+    const history = await get<PhotoPurchase[]>("/photo-imports");
+    expect(history[0].id).toBe(p.id);
+  });
+  it("keeps unknown quantity, low confidence, raw rice and unknown foods pending while registering only clear rows", async () => {
+    provider(
+      recognition([
+        recognized(),
+        recognized({
+          label: "トマト",
+          ingredientId: "tomato",
+          foodState: "raw",
+          amount: null,
+          unit: null,
+          packs: null,
+          quantityEvidence: "",
+        }),
+        recognized({
+          label: "卵豆腐",
+          ingredientId: "egg",
+          foodState: "raw",
+          packs: 1,
+          quantityEvidence: "200g",
+        }),
+        recognized({
+          label: "無洗米",
+          ingredientId: "rice",
+          foodState: "cooked",
+          packs: 1,
+        }),
+        recognized({ label: "謎の食品", ingredientId: "made-up-id", packs: 1 }),
+        recognized({
+          label: "にんじん",
+          ingredientId: "carrot",
+          foodState: "raw",
+          confidence: 0.5,
+          packs: 1,
+        }),
+      ]),
+    );
+    const p = await imported();
+    expect(p.status).toBe("review");
+    expect(p.items.filter((i) => i.status === "pending")).toHaveLength(5);
+    expect(await quantityOf("tofu")).toBe(400);
+    expect(await quantityOf("rice")).toBe(0);
+    expect(await quantityOf("egg")).toBe(0);
+    expect(p.items.find((i) => i.label === "無洗米")?.amount).toBeNull();
+    const rawRice = p.items.find((i) => i.label === "無洗米")!;
+    expect(
+      (
+        await request(`/photo-imports/${p.id}/resolve`, {
+          version: p.version,
+          idempotencyKey: "reject-raw-rice-as-cooked",
+          items: [{ id: rawRice.id, ingredientId: "rice", amount: 200 }],
+        })
+      ).status,
+    ).toBe(422);
+    const target = p.items.find((i) => i.label === "トマト")!;
+    const body = {
+      version: p.version,
+      idempotencyKey: "resolve-quantity-key",
+      items: [{ id: target.id, ingredientId: "tomato", amount: 300 }],
+    };
+    const result = await post<PhotoPurchase>(
+      `/photo-imports/${p.id}/resolve`,
+      body,
+    );
+    await post(`/photo-imports/${p.id}/resolve`, body);
+    expect(await quantityOf("tomato")).toBe(300);
+    expect(result.items.filter((i) => i.status === "pending")).toHaveLength(4);
+  });
+  it("fails unreadable/malformed/blocked responses with zero movements and permits explicit retry only", async () => {
+    const spy = provider({ receipt: null, items: [] });
+    const failed = await imported("unreadable-photo-key");
+    expect(failed.status).toBe("failed");
+    expect(failed.error_code).toBe("PHOTO_UNREADABLE");
+    await imported("unreadable-photo-key");
+    expect(spy).toHaveBeenCalledTimes(1);
+    spy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              finishReason: "MAX_TOKENS",
+              content: { parts: [{ text: "{}" }] },
+            },
+          ],
+        }),
+      ),
+    );
+    const malformed = await imported("explicit-new-retry-key");
+    expect(malformed.status).toBe("failed");
+    expect(malformed.error_code).toBe("PHOTO_AI_INVALID");
+    expect(await quantityOf("tofu")).toBe(0);
+    spy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              finishReason: "STOP",
+              content: { parts: [{ text: JSON.stringify(recognition()) }] },
+            },
+          ],
+        }),
+      ),
+    );
+    const done = await imported("explicit-third-retry-key");
+    expect(done.id).toBe(failed.id);
+    expect(await quantityOf("tofu")).toBe(400);
+  });
+  it("supports multiple viewpoints once, ignores repeated identical images inside a request", async () => {
+    const spy = provider();
+    const p = await imported("multiple-images-key", [
+      testPhoto(1),
+      testPhoto(2),
+      testPhoto(1),
+    ]);
+    expect(p.image_count).toBe(2);
+    expect(await quantityOf("tofu")).toBe(400);
+    const content = JSON.parse(String(spy.mock.calls[0][1]?.body));
+    expect(
+      content.contents[0].parts.filter(
+        (i: { inlineData?: unknown }) => i.inlineData,
+      ),
+    ).toHaveLength(2);
+  });
+  it("prevents exact image/key and distinct-photo same-receipt duplicates, including after Undo", async () => {
+    const spy = provider();
+    const first = await imported("duplicate-receipt-key");
+    expect((await imported("duplicate-receipt-key")).id).toBe(first.id);
+    expect((await imported("different-key-same-photo")).id).toBe(first.id);
+    expect(spy).toHaveBeenCalledTimes(1);
+    const other = await imported("different-photo-same-receipt", [
+      testPhoto(3),
+    ]);
+    expect(other.id).toBe(first.id);
+    expect(other.duplicate).toBe(true);
+    expect(await quantityOf("tofu")).toBe(400);
+    await post(`/photo-imports/${first.id}/undo`, {
+      version: first.version,
+      idempotencyKey: "undo-duplicate-key",
+    });
+    const repeated = await imported("after-undo-photo-key", [testPhoto(4)]);
+    expect(repeated.status).toBe("undone");
+    expect(await quantityOf("tofu")).toBe(0);
+    expect((await upload("duplicate-receipt-key", [testPhoto(5)])).status).toBe(
+      409,
+    );
+  });
+  it("asks only when shop/time/total matches without a receipt number, allowing a genuine second purchase", async () => {
+    provider(recognition(undefined, null));
+    const first = await imported();
+    const other = await imported("soft-duplicate-key", [testPhoto(3)]);
+    expect(other.relation).toBe("unknown");
+    expect(other.possible_duplicate_id).toBe(first.id);
+    expect(await quantityOf("tofu")).toBe(400);
+    await post(`/photo-imports/${other.id}/resolve`, {
+      version: other.version,
+      relation: "new",
+      idempotencyKey: "genuine-new-trip-key",
+      items: [],
+    });
+    expect(await quantityOf("tofu")).toBe(800);
+  });
+  it("returns processing for concurrent requests before a provider call resolves and claims only one analysis", async () => {
+    let release!: () => void;
+    const wait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const spy = provider();
+    const original = spy.getMockImplementation()!;
+    spy.mockImplementation(async (...args) => {
+      await wait;
+      return original(...args);
+    });
+    const running = imported("concurrent-first-key");
+    for (let i = 0; i < 50; i++) {
+      const row = await database
+        .prepare("SELECT count(*) AS n FROM photo_analysis_attempts")
+        .first<{ n: number }>();
+      if (row?.n) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const second = await imported("concurrent-second-key");
+    expect(second.status).toBe("processing");
+    release();
+    const done = await running;
+    expect(done.id).toBe(second.id);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(await quantityOf("tofu")).toBe(400);
+  });
+  it("corrects via compensating movements, replays corrections and Undo atomically with immutable audits", async () => {
+    provider();
+    const p = await imported();
+    const correction = {
+      version: p.version,
+      idempotencyKey: "photo-correction-key",
+      items: [{ id: p.items[0].id, ingredientId: "tofu", amount: 250 }],
+    };
+    const revised = await post<PhotoPurchase>(
+      `/photo-imports/${p.id}/correct`,
+      correction,
+    );
+    await post(`/photo-imports/${p.id}/correct`, correction);
+    expect(await quantityOf("tofu")).toBe(250);
+    expect(
+      (
+        await request(`/photo-imports/${p.id}/correct`, {
+          ...correction,
+          idempotencyKey: "stale-photo-key",
+        })
+      ).status,
+    ).toBe(409);
+    const undo = {
+      version: revised.version,
+      idempotencyKey: "whole-photo-undo-key",
+    };
+    const undone = await post<PhotoPurchase>(
+      `/photo-imports/${p.id}/undo`,
+      undo,
+    );
+    await post(`/photo-imports/${p.id}/undo`, undo);
+    expect(undone.status).toBe("undone");
+    expect(await quantityOf("tofu")).toBe(0);
+    const movements = (
+      await database
+        .prepare("SELECT delta,reason FROM inventory_movements ORDER BY rowid")
+        .all()
+    ).results;
+    expect(movements).toEqual([
+      { delta: 400, reason: "purchase" },
+      { delta: -150, reason: "correction" },
+      { delta: -250, reason: "correction" },
+    ]);
+    await expect(
+      database.prepare("DELETE FROM photo_purchase_audits").run(),
+    ).rejects.toThrow();
+  });
+  it("rejects whole Undo when food has already been consumed with no partial rollback", async () => {
+    provider(
+      recognition([
+        recognized(),
+        recognized({
+          label: "トマト",
+          ingredientId: "tomato",
+          foodState: "raw",
+          packs: 1,
+        }),
+      ]),
+    );
+    const p = await imported();
+    const tofu = (await get<Stock[]>("/inventory")).find(
+      (i) => i.id === "tofu",
+    )!;
+    await post("/inventory/adjust", {
+      ingredientId: "tofu",
+      delta: -300,
+      version: tofu.version,
+      idempotencyKey: "used-photo-food-key",
+    });
+    expect(
+      (
+        await request(`/photo-imports/${p.id}/undo`, {
+          version: p.version,
+          idempotencyKey: "insufficient-photo-undo",
+        })
+      ).status,
+    ).toBe(409);
+    expect(await quantityOf("tofu")).toBe(100);
+    expect(await quantityOf("tomato")).toBe(200);
+    expect((await get<PhotoPurchase>(`/photo-imports/${p.id}`)).status).toBe(
+      "applied",
+    );
+  });
+  it("recalculates shopping after photo purchase and forbids stale or all-purchased-quantity confirmation", async () => {
+    const old = await post<Cycle>("/shopping/today", {});
+    const ingredient = old.items[0].ingredient_id;
+    const catalog = await loadIngredients(database);
+    const food = catalog.find((i) => i.id === ingredient)!;
+    const labels: Record<string, string> = {
+      rice: "パックご飯",
+      chicken: "鶏もも肉皮なし",
+      pork: "豚もも赤身",
+      salmon: "しろさけ",
+      tofu: "木綿豆腐",
+      egg: "鶏卵",
+      mushroom: "ぶなしめじ",
+    };
+    const amount = Math.min(50, old.items[0].proposed_amount);
+    provider(
+      recognition([
+        recognized({
+          label: labels[ingredient] ?? food.name,
+          ingredientId: ingredient,
+          foodState: food.state as RecognizedItem["foodState"],
+          amount,
+          packs: 1,
+          unit: "g",
+          quantityEvidence: amount + "g",
+        }),
+      ]),
+    );
+    const p = await imported();
+    expect(p.linked_cycle_id).toBe(old.id);
+    expect(await quantityOf(ingredient)).toBe(amount);
+    expect(
+      (await request(`/shopping/${old.id}/confirm`, await purchaseBody(old)))
+        .status,
+    ).toBe(409);
+    const fresh = await get<Cycle>("/shopping/current");
+    expect(fresh.photo_registered).toEqual([
+      { ingredient_id: ingredient, amount },
+    ]);
+    const body = await purchaseBody(fresh);
+    expect((await request(`/shopping/${fresh.id}/confirm`, body)).status).toBe(
+      422,
+    );
+    await post(`/shopping/${fresh.id}/confirm`, {
+      ...body,
+      amountPolicy: "remaining",
+    });
+    expect(await quantityOf(ingredient)).toBe(
+      amount +
+        (body.items.find((i) => i.ingredientId === ingredient)?.amount ?? 0),
+    );
+  });
+  it("asks about manual-first overlap and registers only the unrecorded part of a partial purchase", async () => {
+    await planTofu();
+    const cycle = await post<Cycle>("/shopping/today", {});
+    const amounts = await purchaseBody(cycle);
+    const tofu = amounts.items.find((i) => i.ingredientId === "tofu");
+    expect(tofu).toBeDefined();
+    amounts.items = amounts.items.map((i) => ({
+      ...i,
+      amount: i.ingredientId === "tofu" ? 100 : 0,
+    }));
+    await post(`/shopping/${cycle.id}/confirm`, amounts);
+    provider();
+    const p = await imported();
+    expect(p.relation).toBe("unknown");
+    expect(p.manual_candidates).toBe(1);
+    expect(await quantityOf("tofu")).toBe(100);
+    const resolved = await post<PhotoPurchase>(
+      `/photo-imports/${p.id}/resolve`,
+      {
+        version: p.version,
+        relation: "same",
+        items: [],
+        idempotencyKey: "same-manual-photo-key",
+      },
+    );
+    expect(await quantityOf("tofu")).toBe(400);
+    expect(resolved.items[0].applied_amount).toBe(300);
+    const saved = await database
+      .prepare(
+        "SELECT actual_amount FROM shopping_run_items WHERE cycle_id=? AND ingredient_id='tofu'",
+      )
+      .bind(cycle.id)
+      .first();
+    expect(saved).toEqual({ actual_amount: 100 });
+    await post(`/photo-imports/${p.id}/undo`, {
+      version: resolved.version,
+      idempotencyKey: "undo-only-photo-part",
+    });
+    expect(await quantityOf("tofu")).toBe(100);
+  });
+  it("does not silently add manual-first recorded purchases; recorded relation leaves the manual ledger intact", async () => {
+    await planTofu();
+    const cycle = await post<Cycle>("/shopping/today", {});
+    const b = await purchaseBody(cycle);
+    b.items = b.items.map((i) => ({
+      ...i,
+      amount: i.ingredientId === "tofu" ? 400 : 0,
+    }));
+    await post(`/shopping/${cycle.id}/confirm`, b);
+    provider();
+    const p = await imported();
+    await post(`/photo-imports/${p.id}/resolve`, {
+      version: p.version,
+      relation: "recorded",
+      items: [],
+      idempotencyKey: "already-manual-recorded",
+    });
+    expect(await quantityOf("tofu")).toBe(400);
+    expect(
+      (
+        await database
+          .prepare(
+            "SELECT count(*) AS n FROM inventory_movements WHERE source_id=?",
+          )
+          .bind(p.id)
+          .first<{ n: number }>()
+      )?.n,
+    ).toBe(0);
+  });
+  it("requires auth and origin, validates uploads before provider calls and preserves manual fallback when unconfigured", async () => {
+    const spy = provider();
+    expect((await upload(undefined, undefined, false)).status).toBe(401);
+    expect(
+      (await upload(undefined, undefined, true, "https://other.test")).status,
+    ).toBe(403);
+    expect((await upload(undefined, [])).status).toBe(422);
+    expect(
+      (
+        await upload(undefined, [
+          new File(["bad"], "bad.jpg", { type: "image/jpeg" }),
+        ])
+      ).status,
+    ).toBe(422);
+    expect(
+      (
+        await upload(
+          undefined,
+          Array.from({ length: 5 }, (_, i) => testPhoto(i)),
+        )
+      ).status,
+    ).toBe(422);
+    env.GEMINI_PAID_TIER = "false";
+    expect((await upload()).status).toBe(503);
+    expect(spy).not.toHaveBeenCalled();
+    await post("/inventory/adjust", {
+      ingredientId: "tofu",
+      delta: 100,
+      version: 0,
+      idempotencyKey: "manual-photo-fallback",
+    });
+    expect(await quantityOf("tofu")).toBe(100);
+  });
+  it("limits actual bytes and model attempts without extra calls or mutations", async () => {
+    const spy = provider({ receipt: null, items: [] });
+    const big = new File([new Uint8Array(7 * 1024 * 1024)], "too-big.png", {
+      type: "image/png",
+    });
+    expect((await upload(undefined, [big])).status).toBe(422);
+    for (let i = 0; i < 5; i++)
+      expect((await imported(crypto.randomUUID(), [testPhoto(i)])).status).toBe(
+        "failed",
+      );
+    const denied = await upload(crypto.randomUUID(), [testPhoto(6)]);
+    expect(denied.status).toBe(503);
+    expect(
+      ((await denied.json()) as { error: { code: string } }).error.code,
+    ).toBe("PHOTO_RATE_LIMIT");
+    expect(spy).toHaveBeenCalledTimes(5);
+    expect(await quantityOf("tofu")).toBe(0);
+  });
+});
+
+describe("Issue #7 migration and competing purchase protection", () => {
+  it("preserves populated 0006 tables exactly including purchases, inventory, plans and meal snapshots", async () => {
+    await fill();
+    const cycle = await post<Cycle>("/shopping/today", {});
+    const p = (await get<Plan[]>("/plans"))[0];
+    await post(`/plans/${p.id}/complete`, {
+      version: p.version,
+      items: managedItems(p.recipe),
+      idempotencyKey: "before-seven-meal-key",
+    });
+    await database.batch([
+      database
+        .prepare(
+          "INSERT INTO operations(idempotency_key,kind,payload,result_id) VALUES ('before-seven-buy','purchase','{}',?)",
+        )
+        .bind(cycle.id),
+      database
+        .prepare(
+          "UPDATE shopping_runs SET status='confirmed',idempotency_key='before-seven-buy',version=version+1 WHERE id=?",
+        )
+        .bind(cycle.id),
+      database
+        .prepare(
+          "INSERT INTO shopping_run_items VALUES ('before-seven-item',?,'tofu',100,100,100,'g','confirmed')",
+        )
+        .bind(cycle.id),
+      database
+        .prepare(
+          "INSERT INTO inventory_movements(id,ingredient_id,delta,reason,source_id,idempotency_key) VALUES ('before-seven-movement','tofu',100,'purchase',?,'before-seven-buy')",
+        )
+        .bind(cycle.id),
+    ]);
+    // D1 blocks sqlite_master because it also exposes Cloudflare's private metadata.
+    // Enumerate only our public tables from the immutable migration definitions.
+    const migrationFiles = [
+      "0001_schema.sql",
+      "0002_seed.sql",
+      "0003_corrections.sql",
+      "0004_pantry_recipe_details.sql",
+      "0005_shopping_schedule_candidates.sql",
+      "0006_anytime_shopping.sql",
+    ];
+    const names = new Set(
+      migrationFiles.flatMap((file) =>
+        [
+          ...readFileSync(
+            new URL("../migrations/" + file, import.meta.url),
+            "utf8",
+          ).matchAll(/CREATE TABLE(?: IF NOT EXISTS)?\s+(\w+)/g),
+        ].map((m) => m[1]),
+      ),
+    );
+    const tables = [...names].map((name) => ({ name }));
+    expect(tables.length).toBeGreaterThan(15);
+    const before: Record<string, unknown[]> = {};
+    for (const { name } of tables)
+      before[name] = (
+        await database.prepare(`SELECT * FROM ${name} ORDER BY rowid`).all()
+      ).results;
+    await applyMigration("0007_photo_purchases.sql");
+    for (const { name } of tables)
+      expect(
+        (await database.prepare(`SELECT * FROM ${name} ORDER BY rowid`).all())
+          .results,
+        name,
+      ).toEqual(before[name]);
+    expect(await get<PhotoPurchase[]>("/photo-imports")).toEqual([]);
+  });
+  it("deduplicates competing distinct photos of one numbered receipt and conflicting corrections", async () => {
+    provider();
+    const results = await Promise.all([
+      imported("parallel-receipt-one", [testPhoto(1)]),
+      imported("parallel-receipt-two", [testPhoto(2)]),
+    ]);
+    expect(new Set(results.map((p) => p.id)).size).toBe(1);
+    expect(await quantityOf("tofu")).toBe(400);
+    const p = await get<PhotoPurchase>(`/photo-imports/${results[0].id}`);
+    const competing = await Promise.all(
+      [250, 300].map((amount) =>
+        request(`/photo-imports/${p.id}/correct`, {
+          version: p.version,
+          idempotencyKey: crypto.randomUUID(),
+          items: [{ id: p.items[0].id, ingredientId: "tofu", amount }],
+        }),
+      ),
+    );
+    expect(competing.map((r) => r.status).sort()).toEqual([200, 409]);
+    expect([250, 300]).toContain(await quantityOf("tofu"));
+  });
+  it("handles manual confirmation during image analysis as an exception instead of double addition", async () => {
+    await planTofu();
+    const cycle = await post<Cycle>("/shopping/today", {});
+    const b = await purchaseBody(cycle);
+    b.items = b.items.map((i) => ({
+      ...i,
+      amount: i.ingredientId === "tofu" ? 400 : 0,
+    }));
+    let release!: () => void;
+    const wait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const spy = provider();
+    const original = spy.getMockImplementation()!;
+    spy.mockImplementation(async (...args) => {
+      await wait;
+      return original(...args);
+    });
+    const running = imported("photo-during-manual-key");
+    for (let i = 0; i < 50 && !spy.mock.calls.length; i++)
+      await new Promise((r) => setTimeout(r, 10));
+    await post(`/shopping/${cycle.id}/confirm`, b);
+    release();
+    const p = await running;
+    expect(p.relation).toBe("unknown");
+    expect(await quantityOf("tofu")).toBe(400);
+  });
+  it("can explicitly retry an abandoned processing lease while ignoring the original late response", async () => {
+    let release!: () => void;
+    const wait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const spy = provider();
+    const original = spy.getMockImplementation()!;
+    spy.mockImplementationOnce(async (...args) => {
+      await wait;
+      return original(...args);
+    });
+    const running = imported("expired-owner-first-key");
+    for (let i = 0; i < 50 && !spy.mock.calls.length; i++)
+      await new Promise((r) => setTimeout(r, 10));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 121000);
+    const retry = await imported("expired-owner-retry-key");
+    expect(retry.status).toBe("applied");
+    release();
+    const late = await running;
+    expect(late.id).toBe(retry.id);
+    expect(await quantityOf("tofu")).toBe(400);
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+  it("enforces monthly attempt limits as well as daily limits, counting failures as possible paid calls", async () => {
+    const spy = provider({ receipt: null, items: [] });
+    const p = await imported();
+    const month = new Date().toISOString().slice(0, 7) + "-01T00:00:00.000Z";
+    await database.batch(
+      Array.from({ length: 59 }, () =>
+        database
+          .prepare(
+            "INSERT INTO photo_analysis_attempts(id,purchase_id,created_at) VALUES (?,?,?)",
+          )
+          .bind(crypto.randomUUID(), p.id, month),
+      ),
+    );
+    const r = await upload("monthly-cap-photo-key", [testPhoto(3)]);
+    expect(r.status).toBe(503);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Issue #7 incomplete receipt identity", () => {
+  it("holds a missing-number second photo against a numbered first receipt instead of double registration", async () => {
+    const spy = provider();
+    const first = await imported();
+    spy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              finishReason: "STOP",
+              content: {
+                parts: [{ text: JSON.stringify(recognition(undefined, null)) }],
+              },
+            },
+          ],
+        }),
+      ),
+    );
+    const second = await imported("receipt-number-missing-key", [testPhoto(3)]);
+    expect(second.relation).toBe("unknown");
+    expect(second.possible_duplicate_id).toBe(first.id);
+    expect(await quantityOf("tofu")).toBe(400);
+  });
+  it("requires an exception decision for repeated foods when a different photo has no usable receipt", async () => {
+    provider({ receipt: null, items: [recognized()] });
+    const first = await imported();
+    const second = await imported("no-receipt-new-view-key", [testPhoto(3)]);
+    expect(second.relation).toBe("unknown");
+    expect(second.possible_duplicate_id).toBe(first.id);
+    expect(await quantityOf("tofu")).toBe(400);
+    await post(`/photo-imports/${second.id}/resolve`, {
+      version: second.version,
+      idempotencyKey: "no-receipt-already-recorded",
+      relation: "recorded",
+      items: [],
+    });
+    expect(await quantityOf("tofu")).toBe(400);
+  });
+});
+
+describe("Issue #7 uncertain photo rows after manual fallback", () => {
+  it("does not count pending foods twice when manually purchased after the clear photo rows were added", async () => {
+    await planTofu();
+    const original = await post<Cycle>("/shopping/today", {});
+    provider(
+      recognition([
+        recognized(),
+        recognized({
+          label: "パックご飯",
+          ingredientId: "rice",
+          foodState: "cooked",
+          amount: null,
+          unit: null,
+          packs: null,
+          quantityEvidence: "",
+        }),
+      ]),
+    );
+    const p = await imported();
+    expect(p.status).toBe("review");
+    expect(await quantityOf("tofu")).toBe(400);
+    const cycle = await get<Cycle>("/shopping/current");
+    expect(cycle.id).toBe(original.id);
+    const body = await purchaseBody(cycle);
+    body.items = body.items.map((i) => ({
+      ...i,
+      amount: i.ingredientId === "rice" ? 100 : 0,
+    }));
+    await post(`/shopping/${cycle.id}/confirm`, {
+      ...body,
+      amountPolicy: "remaining",
+    });
+    const pending = p.items.find((i) => i.status === "pending")!;
+    expect(
+      (
+        await request(`/photo-imports/${p.id}/resolve`, {
+          version: p.version,
+          idempotencyKey: "pending-manual-duplicate-key",
+          items: [{ id: pending.id, ingredientId: "rice", amount: 100 }],
+        })
+      ).status,
+    ).toBe(422);
+    expect(await quantityOf("rice")).toBe(100);
+    await post(`/photo-imports/${p.id}/resolve`, {
+      version: p.version,
+      idempotencyKey: "pending-manual-already-saved",
+      items: [{ id: pending.id, ingredientId: null, amount: 0 }],
+    });
+    expect(await quantityOf("rice")).toBe(100);
+    expect(await quantityOf("tofu")).toBe(400);
   });
 });

@@ -28,7 +28,18 @@ import {
 } from "./planner";
 import * as db from "./db";
 import { actualItems, recipeItem } from "./recipe";
-export interface Env {
+import { MAX_UPLOAD_BYTES } from "./photo-upload";
+import type { PhotoAIEnv } from "./photo-ai";
+import {
+  importPhotos,
+  photoPurchase,
+  photoHistory,
+  editPhoto,
+  undoPhoto,
+  photoCredits,
+} from "./photo-service";
+import { photoEditSchema, photoUndoSchema } from "./photo-contracts";
+export interface Env extends PhotoAIEnv {
   DB: D1Database;
   APP_PASSWORD: string;
   ASSETS: Fetcher;
@@ -93,12 +104,18 @@ app.use("/api/*", async (c, next) => {
         403,
       );
     const declared = Number(c.req.header("Content-Length") ?? 0);
-    if (declared > 65536)
+    const photoUpload =
+      c.req.method === "POST" && c.req.path === "/api/photo-imports";
+    if (declared > (photoUpload ? MAX_UPLOAD_BYTES : 65536))
       throw new DomainError("PAYLOAD_TOO_LARGE", "入力が大きすぎます", 422);
     // Read and bound actual body as well (Content-Length can be absent or forged).
-    if (new TextEncoder().encode(await c.req.raw.clone().text()).length > 65536)
+    if (
+      !photoUpload &&
+      new TextEncoder().encode(await c.req.raw.clone().text()).length > 65536
+    )
       throw new DomainError("PAYLOAD_TOO_LARGE", "入力が大きすぎます", 422);
     if (
+      !photoUpload &&
       c.req.method !== "DELETE" &&
       !c.req.header("Content-Type")?.startsWith("application/json")
     )
@@ -441,8 +458,50 @@ app.post("/api/plans/:id/complete", async (c) => {
       .first(),
   );
 });
-app.get("/api/shopping/current", async (c) =>
-  c.json(await db.shopping(c.env.DB, tokyoDate())),
+app.get("/api/shopping/current", async (c) => {
+  const cycle = await db.shopping(c.env.DB, tokyoDate());
+  return c.json(
+    cycle
+      ? { ...cycle, photo_registered: await photoCredits(c.env.DB, cycle) }
+      : null,
+  );
+});
+app.get("/api/photo-imports", async (c) =>
+  c.json(await photoHistory(c.env.DB)),
+);
+app.get("/api/photo-imports/:id", async (c) =>
+  c.json(await photoPurchase(c.env.DB, c.req.param("id"))),
+);
+app.post("/api/photo-imports", async (c) =>
+  c.json(await importPhotos(c.env.DB, c.env, c.req.raw)),
+);
+app.post("/api/photo-imports/:id/resolve", async (c) =>
+  c.json(
+    await editPhoto(
+      c.env.DB,
+      c.req.param("id"),
+      photoEditSchema.parse(await c.req.json()),
+    ),
+  ),
+);
+app.post("/api/photo-imports/:id/correct", async (c) =>
+  c.json(
+    await editPhoto(
+      c.env.DB,
+      c.req.param("id"),
+      photoEditSchema.parse(await c.req.json()),
+      "correct",
+    ),
+  ),
+);
+app.post("/api/photo-imports/:id/undo", async (c) =>
+  c.json(
+    await undoPhoto(
+      c.env.DB,
+      c.req.param("id"),
+      photoUndoSchema.parse(await c.req.json()),
+    ),
+  ),
 );
 app.post("/api/shopping/today", async (c) => {
   z.object({})
@@ -480,6 +539,13 @@ app.post("/api/shopping/:id/confirm", async (c) => {
       409,
     );
   const si = await db.cycleItems(c.env.DB, cycle);
+  const credits = await photoCredits(c.env.DB, cycle);
+  if (credits.length && b.amountPolicy !== "remaining")
+    throw new DomainError(
+      "PHOTO_ALREADY_REGISTERED",
+      "写真で登録した分を含めず、未登録の追加購入量だけ確定してください",
+      422,
+    );
   if (
     b.items.length !== si.length ||
     b.items.some((i) => !si.some((s) => s.ingredient_id === i.ingredientId))

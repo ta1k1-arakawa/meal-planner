@@ -14,6 +14,7 @@ import { RecipeDetails } from "./RecipeDetails";
 import { RecipeCandidatePicker } from "./RecipeCandidatePicker";
 import { useAutoRefresh } from "./useAutoRefresh";
 import { sameShoppingDays } from "../worker/planner";
+import { PhotoPurchases } from "./PhotoPurchases";
 type Screen = "今日" | "献立" | "買い物" | "在庫" | "レシピ" | "設定";
 export class ApiError extends Error {
   constructor(
@@ -67,7 +68,9 @@ export function App() {
   } | null>(null);
   const [error, setError] = useState(""),
     [message, setMessage] = useState(""),
-    [busy, setBusy] = useState(false);
+    [operationBusy, setBusy] = useState(false);
+  const [photoBusy, setPhotoBusy] = useState(false);
+  const busy = operationBusy || photoBusy;
   const requestLock = useRef(false);
   const refreshPromise = useRef<Promise<Plan[]> | null>(null);
   const shoppingVersion = useRef("");
@@ -152,7 +155,7 @@ export function App() {
     success: string,
     refresh = true,
   ) {
-    if (requestLock.current) return;
+    if (requestLock.current || photoBusy) return;
     requestLock.current = true;
     setBusy(true);
     setError("");
@@ -770,6 +773,24 @@ export function App() {
         {screen === "買い物" && (
           <>
             <h2>今日の買い物</h2>
+            <PhotoPurchases
+              ingredients={ingredients}
+              disabled={operationBusy}
+              onWorking={setPhotoBusy}
+              onChanged={async () => {
+                if (refreshPromise.current)
+                  await refreshPromise.current.catch(() => {});
+                const latest = await api<Cycle | null>("/shopping/current");
+                if (
+                  shoppingVersion.current !==
+                  (latest ? latest.id + ":" + latest.version : "")
+                ) {
+                  shoppingDirty.current = false;
+                  setShoppingEdited(false);
+                }
+                return reload();
+              }}
+            />
             <button
               disabled={busy}
               onClick={() =>
@@ -809,14 +830,20 @@ export function App() {
                   </p>
                 )}
                 <p className="muted">
-                  献立全体の不足量です。購入済みの量だけ確定してください。購入しなかった項目は0に変更してください。
+                  献立全体の不足量です。写真で登録した量を含めず、まだ在庫に登録していない追加購入量だけ確定してください。購入しなかった項目は0に変更してください。
                 </p>
+                {!!cycle.photo_registered?.length && (
+                  <p className="notice">
+                    写真の購入分は在庫に登録済みです。下の数量は未登録の買い足し分です。
+                  </p>
+                )}
                 {cycle.items.length ? (
                   <form
                     onSubmit={(e) => {
                       e.preventDefault();
                       const value = {
                         version: cycle.version,
+                        amountPolicy: "remaining" as const,
                         items: cycle.items.map((i) => ({
                           ingredientId: i.ingredient_id,
                           amount: shopAmounts[i.ingredient_id],

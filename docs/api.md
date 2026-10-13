@@ -1,6 +1,6 @@
-# API contract v1.3 (MVP / Issue #6)
+# API contract v1.4 (MVP / Issue #7)
 
-同一オリジンの `/api`。JSON本文、全ての非ログインAPIに署名Cookieが必要です。POST / PUT は別オリジンから拒否します。`APP_PASSWORD` が未設定または32文字未満なら503。クライアントは401でログイン画面へ戻ります。
+同一オリジンの `/api`。写真アップロード以外はJSON本文。全ての非ログインAPIに署名Cookieが必要です。POST / PUT は別オリジンから拒否します。`APP_PASSWORD` が未設定または32文字未満なら503。クライアントは401でログイン画面へ戻ります。
 
 エラーは `{ "error": { "code": "...", "message": "日本語", "details": ... } }`。入力不正400、未ログイン401、送信元不正403、対象なし404、競合・在庫不足409、条件を満たせない422。破壊的更新に version を使います。
 
@@ -21,7 +21,7 @@
 | POST /plans/:id/skip                 | `{version}`                                                                                                                       |
 | POST /plans/:id/unskip               | `{version}`、本日以降のスキップを元の料理の予定に戻し、未確定の買い物リストを再計算。過去分・二重実行は拒否                       |
 | GET /shopping/current                | 現在の曜日に合う次回買い物の周期を優先、未購入/購入済み数量・未作成の日付                                                         |
-| POST /shopping/:id/confirm           | `{version, idempotencyKey, items:[{ingredientId,amount}]}`、全リスト項目を指定。未購入は0                                         |
+| POST /shopping/:id/confirm           | `{version, idempotencyKey, amountPolicy?:"remaining", items:[{ingredientId,amount}]}`、未登録量を全リスト項目へ指定。未購入は0    |
 | GET /meal-logs                       | 直近100件の元の確定スナップショット                                                                                               |
 | GET /meal-logs/:id                   | 食材スナップショット・訂正履歴を含む                                                                                              |
 | POST /meal-logs/:id/correct          | `{version, idempotencyKey, items:[{ingredientId,amount}]}`、versionは訂正番号（初回0）。全実使用量を置換する訂正スナップショット  |
@@ -83,3 +83,30 @@ Cycleに `kind:"cycle"|"run"` を追加し、旧サイクルと買い物ごと�
 献立画面は `/today` の日付以降だけを描画します。`GET /plans`、食事ログ・訂正・台帳APIは従来どおり保持し、記録タブ削除に伴うDB削除は行いません。新UIはチェックを廃止しますが、settings APIの `discardPendingShopping` 確認フラグは保持し、必要な場面にだけ短いダイアログを出します。
 
 `0006` は追加表だけを作り、既存行を変更しません。リリースは既存の手動Actionsでバックアップ→移行→配信を実行し、この開発作業では本番操作しません。
+
+## 写真登録（Issue #7）
+
+| ルート                          | 操作 / 本文                                                                                                                                                                    |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| POST /photo-imports             | 認証済みmultipart/form-data: idempotencyKey、images(File)×1〜4。即時解析後のPhotoPurchase（processing/review/applied/failed/undone）を返す。高信頼項目は自動で原子的に在庫追加 |
+| GET /photo-imports              | 直近20件の非重複元の履歴。画像/レシート全文は返さない                                                                                                                          |
+| GET /photo-imports/:id          | 現在の登録内容/version/各行。重複別名は元の履歴へ解決                                                                                                                          |
+| POST /photo-imports/:id/resolve | `{version,idempotencyKey,relation?:"new"\|"same"\|"recorded",items:[{id,ingredientId:null\|string,amount:int}]}`。保留行だけの部分編集。null/0は登録しない                     |
+| POST /photo-imports/:id/correct | 同形式。指定した行だけを差分訂正。未指定行を維持し、元の監査/在庫台帳は上書きしない                                                                                            |
+| POST /photo-imports/:id/undo    | `{version,idempotencyKey}`。今回の追加分全体を補償移動。使用後の不足は409で全体拒否                                                                                            |
+
+撮影は高信頼登録の明示許可。確信度>=.97だけでなく既存辞書の名前/状態/明記数量/パック数を検証。Pending項目は在庫を変えない。数量は常に辞書の正準整数g/ml。個数は設定係数を解析時にスナップショットして換算し、densityや炊飯係数を作らない。常備調味料は無視する。確信度はモデルの自己申告であり実測精度ではない。
+
+画像は実本文6MiB以内、JPEG/PNG1.5MiB/枚、寸法3072以下・6Mpx以下。MIME/マジック/寸法を検査し、認証後にストリーム実バイト数を制限する。uploadだけにmultipart例外を適用し、他のJSON上限64KiBを維持。サーバー未設定PHOTO_AI_NOT_CONFIGURED/解析上限PHOTO_RATE_LIMITは503で手動入力へ。解析失敗はPhotoPurchase.status=failed/error_codeとして返し、在庫は変えない。途中失敗後にステージ済みreviewがあればreviewを保持し、勝手に再送しない。
+
+同じキーは同じ正確な写真集合だけに使う（違う写真は409）。画像一意claimはAPI呼び出し前に取得。processing中の再送は既存結果だけを返す。失敗/120秒lease期限切れに限り、同じ全画像と新しい明示キーで再解析可能。日5/月60（UTC）の試行上限をD1でguardし、失敗も費用の可能性があるのでカウント。AIは40秒/出力8192token上限。背景GETは解析や在庫操作をしない。
+
+番号付き高信頼レシートはsalt付きの店舗/日時（分単位）/合計/通貨/番号hashで一意判定。番号がない場合は番号を除いた店舗/日時/合計の衝突をpossible_duplicate_idとして例外確認し、明示newなら実際の2回目購入として許可する。レシート識別がない場合も同日の既存写真との食品重複（または別の解析中写真）を例外確認し、無条件に再追加しない。取り消した元の識別も残す。画像・レシート本文・APIキー・saltは返さず、画像を永続保存しない。
+
+Manual-first: レシート日付の同じ食品を手動購入した履歴があればrelation=unknownのreviewで停止。recordedは追加なし、newは別購入、sameは唯一の対応購入の既存actual_amountから他の写真のmanual_offsetを除いた分を控除し、未登録分だけを追加する。対応履歴が複数または弱いレシート衝突ならsameを拒否。手動行/食事スナップショットは変更しない。
+
+Photo-first: 全pending買い物リストを在庫反映後へ再計算・version更新。GET /shopping/currentのphoto_registeredはそのcycleへ写真から追加した正準量（manual_offset除外）。残る手動確定はamountPolicy="remaining"が必要、写真分を含めない。旧versionは409。既存の成功済み旧JSONリクエストは元のidempotent結果を返す。手動確定と解析/適用が競合する場合はstock/cycle/root/credits CASで二重書き込みを防ぎ、手動側が先なら関係を再確認する。
+
+監査はauto/resolve/correct/undoと変更前後の全行スナップショットを追記し、UPDATE/DELETEをtriggerで禁止。operationsは既存purchase/correction kind、movementはpurchase/correction reasonを使い、stock/reconcile/credits/audit/root versionを同じD1 batchで更新する。
+
+写真先行の保留食品をリンク先の買い物リストで手動確定した後、同じ保留行を追加する操作はPHOTO_PENDING_MANUAL_OVERLAPで422。黙って再加算しない。同一購入なら保留行をnull/0で登録対象外にし、別の購入は明示的な在庫入力で扱える。未入力の保留行はクライアントから送らず、部分確認を維持する。
