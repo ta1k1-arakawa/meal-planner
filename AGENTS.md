@@ -13,7 +13,7 @@ Build a private, mobile-first Japanese-language web app for one person that auto
 - Breakfast default **none**; alternative preset **2 mochi**. User can override by day or edit presets. Do not silently assume breakfast was eaten.
 - Bedtime protein preset **one serving**; configurable brand, serving size, liquid, kcal, protein, and default inclusion. Do not claim consumption without distinguishing estimate/preset from confirmed intake.
 - Lunch and snacks are optional manual nutrition entries; do not plan them.
-- Shopping: **twice per week**, weekdays configurable; generate all dinners until the next shopping day, taking planned consumption into account.
+- Shopping: **any day**, with two configurable recommended cycle weekdays; generate all dinners until the next shopping day, taking planned consumption into account.
 - **No expiration / best-before date tracking or prioritization.** This is a product scope choice, not a statement that food cannot spoil.
 - Pantry seasonings (`inventory_exempt=1`; initially oil/soy/miso/sugar/curry) require no stock, purchase or actual-amount input. Fresh ginger remains managed. Keep every seasoning in ingredient display, nutrition and allergen checks.
 - Photo import: support photographing products/labels/receipts; infer items and approximate quantities, clearly tag estimates and require human confirmation before inventory mutation.
@@ -64,14 +64,14 @@ Build a private, mobile-first Japanese-language web app for one person that auto
 ## Planner constraints
 
 - Hard: <=30 min estimated prep + cooking, dinner-only, no food allergy violations, suitable equipment, feasible portion amounts.
-- When it is not shopping day, prioritize existing inventory. When planning for a shopping cycle, derive required purchase quantities from cumulative deficits across all dinners, not independently per recipe.
+- Preserve the stock-only planner API. Mobile shopping always allows a reviewed purchase on any weekday. When planning for a shopping cycle, derive required purchase quantities from cumulative deficits across all dinners, not independently per recipe.
 - Soft: dinner kcal/protein near target, minimize purchased leftovers, variety, fewer purchases, user preferences.
 - If constraints are unsatisfiable, return a transparent explanation and viable user choices; do not produce an infeasible plan labeled as valid.
 - In MVP, use a deterministic recipe catalog and rule-based search/scoring. External LLM is optional and must not be on the critical path for ordinary dinner generation.
 
 ## UI rules
 
-Mobile-first Japanese interface with screens: 今日, 献立, 買い物, 在庫, 記録, 設定. Core actions should take few taps. Before stock-consuming actions show the amount and allow changes. Photo recognition must use an editable review table with confidence/estimate indicators. Show kcal, protein, cooking time, ingredients, cooking steps, and available vs missing materials. Meet accessible button targets and keyboard semantics.
+Mobile-first Japanese interface with screens: 今日, 献立, 買い物, 在庫, レシピ; 設定 via a labelled gear. Hide past plans using the Tokyo date, keep all historical records and APIs, and show candidates inside their own card. Core actions should take few taps. Before stock-consuming actions show the amount and allow changes. Photo recognition must use an editable review table with confidence/estimate indicators. Show kcal, protein, cooking time, ingredients, cooking steps, and available vs missing materials. Meet accessible button targets and keyboard semantics.
 
 ## Testing acceptance checklist
 

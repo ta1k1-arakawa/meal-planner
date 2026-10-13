@@ -55,6 +55,7 @@ nav {
   border-bottom: 1px solid #dce2d9;
 }
 nav button {
+  flex: 1;
   background: transparent;
   color: #526759;
   min-width: 58px;
@@ -232,6 +233,31 @@ fieldset {
 }
 .review {
   border: 2px solid #245b45;
+}
+.settings-button {
+  margin-left: 8px;
+  min-width: 44px;
+}
+.feedback {
+  position: fixed;
+  bottom: 12px;
+  left: 16px;
+  right: 16px;
+  max-width: 700px;
+  margin: auto;
+  z-index: 3;
+  pointer-events: none;
+}
+.processing {
+  position: fixed;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 3;
+  background: #245b45;
+  color: white;
+  padding: 8px 20px;
+  border-radius: 24px;
 }
 footer {
   margin-top: 35px;

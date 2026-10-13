@@ -35,6 +35,18 @@ export function RecipeCandidatePicker({
               ? missing.map((i) => `${i.name} ${i.amount}${i.unit}`).join("、")
               : "なし"}
           </p>
+          <details>
+            <summary>使う食材と調味料</summary>
+            <ul>
+              {recipe.items.map((item) => (
+                <li key={item.ingredientId}>
+                  {item.name} {item.amount}
+                  {item.unit}
+                  {item.inventory_exempt ? "（常備調味料）" : ""}
+                </li>
+              ))}
+            </ul>
+          </details>
           <button disabled={busy} onClick={() => select(recipe.id)}>
             この料理に変更して確定
           </button>

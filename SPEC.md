@@ -1,8 +1,8 @@
-# Dinner Planner — Product / Technical Specification v1.3
+# Dinner Planner — Product / Technical Specification v1.4
 
 ## Scope and operating assumptions
 
-Personal Japanese mobile-first PWA. Automatically schedule dinners only. Shopping twice per week on configurable weekdays. One-person portions. Up to 30 minutes including prep. Run without a personal PC via Cloudflare Workers, D1 and static app deployment. Require access control. Target minimal ongoing cost; external vision AI may incur costs.
+Personal Japanese mobile-first PWA. Automatically schedule dinners only. Shopping on any day; two configurable weekdays are recommended cycle boundaries. One-person portions. Up to 30 minutes including prep. Run without a personal PC via Cloudflare Workers, D1 and static app deployment. Require access control. Target minimal ongoing cost; external vision AI may incur costs.
 
 ## Nutrition and default non-dinner behavior
 
@@ -22,7 +22,7 @@ All 30 initial recipes show named foods, exact canonical quantities, seasoning m
 
 ## Planning lifecycle
 
-`draft` -> `planned` -> `completed` or `skipped` (replanning can replace only open days). At shopping day, generate dinners until the day before the following shopping day using current stocks plus proposed purchases. Compute cumulative requirement and deficits for the shopping list. On non-shopping days, plan with stocks already in house unless explicitly allowing a purchase. Use virtual inventory reservations in chronological order. Avoid repeated recipes and penalize large leftover purchases. Ensure feasible portion scaling within 30 minutes. Never decrement actual stock for planned consumption. If a dinner changes, recompute open-day reservations and shopping shortfalls.
+`draft` -> `planned` -> `completed` or `skipped` (replanning can replace only open days). At shopping day, generate dinners until the day before the following shopping day using current stocks plus proposed purchases. Compute cumulative requirement and deficits for the shopping list. Keep the stock-only planner API available; the mobile shopping action always permits a reviewed purchase. Use virtual inventory reservations in chronological order. Avoid repeated recipes and penalize large leftover purchases. Ensure feasible portion scaling within 30 minutes. Never decrement actual stock for planned consumption. If a dinner changes, recompute open-day reservations and shopping shortfalls.
 
 ## Shopping lifecycle
 
@@ -34,9 +34,17 @@ Keep arbitrary two distinct shopping weekdays editable. The current operation us
 
 Changing shopping weekdays requires explicit confirmation when pending lists exist. Mark old review cycles obsolete and recompute the next period from existing plans atomically with settings. Never overwrite existing recipes just for changing weekdays. Show unplanned dates and let the user explicitly generate the full next period. Completed/skipped dinners, confirmed cycles/items, inventory ledger and meal snapshots stay unchanged. Repair already stale reviews via the same confirmed operation even if the current setting already contains the new weekdays.
 
-Use additive migration `0005`: obsolete flag and schedule snapshot on cycles, plus per-plan rejected recipes. Leave migrations `0001`–`0004` immutable. Keep obsolete records; exclude them and any reviews inconsistent with the current schedule from reads, purchase confirmation and projected purchases. If a review at the same unique start date is explicitly discarded, reuse its row with a higher version and recalculated unconfirmed items; never reuse or rewrite a confirmed row. A conflicting confirmed start date is rejected and additional quantities require explicit stock registration. Settings/list/stock/plan versions guard atomic recomputation against concurrent writes.
+Use additive migration `0005`: obsolete flag and schedule snapshot on cycles, plus per-plan rejected recipes. Leave migrations `0001`–`0004` immutable. Keep obsolete records; exclude them and any reviews inconsistent with the current schedule from reads, purchase confirmation and projected purchases. If a review at the same unique start date is explicitly discarded, reuse its row with a higher version and recalculated unconfirmed items; never reuse or rewrite a confirmed row. The legacy cycle creation API rejects a conflicting confirmed start date; the daily shopping flow uses separate shopping runs for additional quantities without changing the original row. Settings/list/stock/plan versions guard atomic recomputation against concurrent writes.
 
-Recipe changes offer up to five ranked candidates with missing named ingredient amounts, kcal/protein and cooking time. Viewing/cancelling does not mutate plans. Prefer distinct ingredient combinations before seasoning variations and allow paging through undisplayed candidates. Exclude the current recipe and recipes previously changed away from on the same plan. Empty/exhausted sets are explained; never silently reset exclusions. On user selection revalidate recipe, stock, equipment/allergen constraints and plan version, then update only that date, record the old recipe as rejected and reconcile all pending lists in one batch. Preserve later recipes and immutable purchases; for confirmed periods require enough stock for the replacement and later dinners. The 30-recipe catalog is still largely five main ingredient families × six seasoning styles; new recipe families can be added independently.
+Recipe changes offer up to five ranked candidates with missing named ingredient amounts, kcal/protein and cooking time. Viewing/cancelling does not mutate plans. Prefer distinct ingredient combinations before seasoning variations and allow paging through undisplayed candidates. Exclude the current recipe and recipes previously changed away from on the same plan. Empty/exhausted sets are explained; never silently reset exclusions. On user selection revalidate recipe, stock, equipment/allergen constraints and plan version, then update only that date, record the old recipe as rejected and reconcile all pending lists in one batch. Preserve later recipes and immutable purchases; stock-only requests require enough stock for the replacement and later dinners; purchase-enabled replacements create a separate supplemental review without editing confirmed purchases. The 30-recipe catalog is still largely five main ingredient families × six seasoning styles; new recipe families can be added independently.
+
+## Mobile daily operation (Issue #6)
+
+Show 今日 / 献立 / 買い物 / 在庫 / レシピ in the main navigation and a labelled settings gear in the header. Plans show only dates >= the server's Asia/Tokyo date; keep past records in D1 and leave completed-today display intact. Remove History UI, not meal log/correction APIs or immutable snapshots. Render candidates inline beneath their own recipe title, at most five per page. Expose busy state, prevent double submission with an immediate lock, keep keyed cards and page position, return focus without scrolling after closing, and recover version conflicts with fresh candidates. All successful changes refresh affected plans, stocks and purchases automatically. Read-only refresh runs on focus/visible/online and periodically while visible, pauses during edits, and never resends mutations.
+
+POST /shopping/today is one explicit action for shopping now on any weekday. Use today through cycleEnd(today, recommendedDays). Preserve planned/draft recipes, completed and skipped plans; create recipes only for missing days. Calculate remaining planned dinner shortages using actual stock. Exclude past unhandled dinners, obsolete proposals and overlapping old unconfirmed periods. Retire expired/inconsistent/overlapping reviews without deleting their rows; preserve all confirmed purchases. Maintain one active pending shopping run per start date and create a separate run after a confirmed purchase, permitting real same-day top-ups without duplicating quantities. Read/reconcile legacy cycles and new runs together in chronological order, projecting valid earlier future proposals once.
+
+Add migration 0006 to create shopping_runs and shopping_run_items with FK/CHECK/unique constraints. Do not rewrite migrations 0001–0005 or transform existing rows. Confirming a run uses the same operations idempotency and stock movement ledger in a single guarded D1 batch. Different-key competing confirmations cannot both succeed. Existing confirmed cycles, meal logs and purchase/stock history remain immutable. A record being hidden in UI does not authorize its deletion. Production deployment and remote migration remain manual and are not executed for this change.
 
 ## Photo recognition
 
@@ -65,7 +73,7 @@ Deployed migrations `0001`–`0003` are immutable. Apply classification, amount-
 
 ## Initial API and UX
 
-Screens: Today (dinner + ingredients + preparation + kcal/protein), Plans (calendar & replace), Shopping (list & confirm), Inventory (manual/photo addition), History (completed meals & daily estimates), Settings (goals, days, presets). REST endpoints enumerated in AGENTS.md. Japanese local dates; timestamps stored UTC. Privacy by default: auth protected, secrets only on backend, no public inventory or images.
+Screens: Today (dinner + ingredients + preparation + kcal/protein), Plans (calendar & replace), Shopping (list & confirm), Inventory (manual/photo addition), Recipes (complete catalog), Settings (goals, days, presets). REST endpoints enumerated in AGENTS.md. Japanese local dates; timestamps stored UTC. Privacy by default: auth protected, secrets only on backend, no public inventory or images.
 
 ## MVP acceptance and milestone order
 
