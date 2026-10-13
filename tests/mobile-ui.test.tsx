@@ -120,6 +120,7 @@ beforeEach(() => {
       const path = String(input).replace("/api", "");
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
       calls.push({ path, body });
+      if (path === "/photo-imports") return response([]);
       if (path === "/inventory")
         return response([
           { id: "rice", name: "ご飯", quantity: 0, version: 0, unit: "g" },

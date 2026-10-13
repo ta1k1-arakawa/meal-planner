@@ -43,6 +43,7 @@ export const completeSchema = z
   })
   .strict();
 export const purchaseSchema = completeSchema.extend({
+  amountPolicy: z.literal("remaining").optional(),
   items: z
     .array(itemSchema)
     .max(80)
@@ -169,6 +170,7 @@ export interface Cycle {
   obsolete: number;
   shopping_days_json: string;
   unplanned_dates?: string[];
+  photo_registered?: { ingredient_id: string; amount: number }[];
 }
 export interface RecipeCandidates {
   planId: string;
