@@ -12,7 +12,6 @@ import {
   selectRecipeSchema,
   settingsSchema,
   dateSchema,
-  type Cycle,
   type RecipeItem,
   type AmountItem,
   type NutritionSummary,
@@ -445,15 +444,19 @@ app.post("/api/plans/:id/complete", async (c) => {
 app.get("/api/shopping/current", async (c) =>
   c.json(await db.shopping(c.env.DB, tokyoDate())),
 );
+app.post("/api/shopping/today", async (c) => {
+  z.object({})
+    .strict()
+    .parse(await c.req.json());
+  return c.json(await db.prepareShoppingToday(c.env.DB));
+});
 app.post("/api/shopping/:id/confirm", async (c) => {
   const b = purchaseSchema.parse(await c.req.json());
   const id = c.req.param("id");
   const payload = JSON.stringify({ id, ...b });
   const old = await db.replay(c.env.DB, b.idempotencyKey, "purchase", payload);
   if (old) return c.json({ cycleId: old });
-  const cycle = await db
-    .stmt(c.env.DB, "SELECT * FROM shopping_cycles WHERE id=?", id)
-    .first<Cycle>();
+  const cycle = await db.cycleById(c.env.DB, id);
   const retried = await db.replay(
     c.env.DB,
     b.idempotencyKey,
@@ -476,11 +479,7 @@ app.post("/api/shopping/:id/confirm", async (c) => {
       "買い物リストは変更済みか確定済みです",
       409,
     );
-  const si = await db.rows<{ ingredient_id: string }>(
-    c.env.DB,
-    "SELECT si.ingredient_id FROM shopping_items si JOIN ingredients i ON i.id=si.ingredient_id WHERE cycle_id=? AND i.inventory_exempt=0",
-    id,
-  );
+  const si = await db.cycleItems(c.env.DB, cycle);
   if (
     b.items.length !== si.length ||
     b.items.some((i) => !si.some((s) => s.ingredient_id === i.ingredientId))
@@ -503,13 +502,13 @@ app.post("/api/shopping/:id/confirm", async (c) => {
     ),
     db.guard(
       c.env.DB,
-      "EXISTS(SELECT 1 FROM shopping_cycles WHERE id=? AND version=? AND status='review' AND obsolete=0)",
+      `EXISTS(SELECT 1 FROM ${db.cycleTable(cycle)} WHERE id=? AND version=? AND status='review' AND obsolete=0)`,
       id,
       b.version,
     ),
     db.stmt(
       c.env.DB,
-      "UPDATE shopping_cycles SET status='confirmed',version=version+1,idempotency_key=? WHERE id=?",
+      `UPDATE ${db.cycleTable(cycle)} SET status='confirmed',version=version+1,idempotency_key=? WHERE id=?`,
       b.idempotencyKey,
       id,
     ),
@@ -518,7 +517,7 @@ app.post("/api/shopping/:id/confirm", async (c) => {
     statements.push(
       db.stmt(
         c.env.DB,
-        "UPDATE shopping_items SET actual_amount=?,status='confirmed' WHERE cycle_id=? AND ingredient_id=?",
+        `UPDATE ${db.cycleItemTable(cycle)} SET actual_amount=?,status='confirmed' WHERE cycle_id=? AND ingredient_id=?`,
         item.amount,
         id,
         item.ingredientId,
@@ -752,10 +751,7 @@ app.get("/api/settings", async (c) => c.json(await db.settings(c.env.DB)));
 app.put("/api/settings", async (c) => {
   const s = settingsSchema.parse(await c.req.json());
   const saved = await db.settings(c.env.DB);
-  const reviewCycles = await db.rows<Cycle>(
-    c.env.DB,
-    "SELECT * FROM shopping_cycles WHERE status='review'",
-  );
+  const reviewCycles = await db.cycleEntries(c.env.DB, "status='review'");
   const changed = !sameShoppingDays(saved.shoppingDays, s.shoppingDays);
   const stale = reviewCycles.filter(
     (c) => !c.obsolete && !currentSchedule(c, s.shoppingDays),

@@ -111,17 +111,48 @@ export async function plans(db: D1Database): Promise<Plan[]> {
     )!,
   }));
 }
+export const cycleTable = (cycle: Pick<Cycle, "kind">) =>
+  cycle.kind === "run" ? "shopping_runs" : "shopping_cycles";
+export const cycleItemTable = (cycle: Pick<Cycle, "kind">) =>
+  cycle.kind === "run" ? "shopping_run_items" : "shopping_items";
+// Filter expressions come exclusively from server code, never request input.
+export function cycleEntries(db: D1Database, filter = "1=1") {
+  return rows<Omit<Cycle, "items">>(
+    db,
+    `SELECT *, 'cycle' AS kind FROM shopping_cycles WHERE ${filter} UNION ALL SELECT *, 'run' AS kind FROM shopping_runs WHERE ${filter} ORDER BY starts_on`,
+  );
+}
+export async function cycleById(db: D1Database, id: string) {
+  return stmt(
+    db,
+    "SELECT *, 'cycle' AS kind FROM shopping_cycles WHERE id=? UNION ALL SELECT *, 'run' AS kind FROM shopping_runs WHERE id=?",
+    id,
+    id,
+  ).first<Cycle>();
+}
+export function cycleItems(db: D1Database, cycle: Pick<Cycle, "id" | "kind">) {
+  return rows<ShoppingItem>(
+    db,
+    `SELECT si.*,i.name FROM ${cycleItemTable(cycle)} si JOIN ingredients i ON i.id=si.ingredient_id WHERE cycle_id=? AND i.inventory_exempt=0 ORDER BY i.name`,
+    cycle.id,
+  );
+}
+
 export async function shopping(
   db: D1Database,
   date: string,
 ): Promise<Cycle | null> {
   const config = await settings(db);
-  const cycles = await rows<Omit<Cycle, "items">>(
-    db,
-    "SELECT * FROM shopping_cycles WHERE obsolete=0 ORDER BY shopping_on",
-  );
+  const cycles = await cycleEntries(db, "obsolete=0");
   const next = nextShoppingDate(date, config.shoppingDays);
   const cycle =
+    cycles.find(
+      (c) =>
+        c.kind === "run" &&
+        c.status === "review" &&
+        c.shopping_on === date &&
+        currentSchedule(c, config.shoppingDays),
+    ) ??
     cycles.find(
       (c) =>
         currentSchedule(c, config.shoppingDays) &&
@@ -139,11 +170,7 @@ export async function shopping(
         c.ends_on >= date,
     );
   if (!cycle) return null;
-  const items = await rows<ShoppingItem>(
-    db,
-    "SELECT si.*,i.name FROM shopping_items si JOIN ingredients i ON i.id=si.ingredient_id WHERE cycle_id=? AND i.inventory_exempt=0 ORDER BY i.name",
-    cycle.id,
-  );
+  const items = await cycleItems(db, cycle);
   const existing = await plans(db);
   const unplanned_dates: string[] = [];
   for (
@@ -274,10 +301,7 @@ export async function reconcileShopping(
   const [ps, stocks, cycles, savedSettings] = await Promise.all([
     plans(db),
     inventory(db),
-    rows<Omit<Cycle, "items">>(
-      db,
-      "SELECT * FROM shopping_cycles WHERE status='review' ORDER BY starts_on",
-    ),
+    cycleEntries(db, "status='review'"),
     settings(db),
   ]);
   const config = options.settingsOverride ?? savedSettings;
@@ -290,7 +314,7 @@ export async function reconcileShopping(
     guard(db, "(SELECT COUNT(*) FROM meal_plans)=?", ps.length),
     guard(
       db,
-      "(SELECT COUNT(*) FROM shopping_cycles WHERE status='review')=?",
+      "((SELECT COUNT(*) FROM shopping_cycles WHERE status='review')+(SELECT COUNT(*) FROM shopping_runs WHERE status='review'))=?",
       cycles.length,
     ),
   ];
@@ -316,7 +340,7 @@ export async function reconcileShopping(
     statements.push(
       guard(
         db,
-        "EXISTS(SELECT 1 FROM shopping_cycles WHERE id=? AND version=? AND status='review')",
+        `EXISTS(SELECT 1 FROM ${cycleTable(c)} WHERE id=? AND version=? AND status='review')`,
         c.id,
         c.version,
       ),
@@ -325,7 +349,7 @@ export async function reconcileShopping(
     statements.push(
       stmt(
         db,
-        "UPDATE shopping_cycles SET obsolete=1,version=version+1 WHERE id=? AND status='review'",
+        `UPDATE ${cycleTable(cycles.find((c) => c.id === id)!)} SET obsolete=1,version=version+1 WHERE id=? AND status='review'`,
         id,
       ),
     );
@@ -333,7 +357,7 @@ export async function reconcileShopping(
     const n = options.newCycle;
     const previous = await stmt(
       db,
-      "SELECT * FROM shopping_cycles WHERE starts_on=?",
+      `SELECT * FROM ${cycleTable(n)} WHERE starts_on=? ${n.kind === "run" ? "AND status='review' AND obsolete=0" : ""}`,
       n.starts_on,
     ).first<Omit<Cycle, "items">>();
     if (previous) {
@@ -356,7 +380,7 @@ export async function reconcileShopping(
       statements.unshift(
         guard(
           db,
-          "EXISTS(SELECT 1 FROM shopping_cycles WHERE id=? AND version=? AND status='review')",
+          `EXISTS(SELECT 1 FROM ${cycleTable(n)} WHERE id=? AND version=? AND status='review')`,
           previous.id,
           previous.version,
         ),
@@ -364,7 +388,7 @@ export async function reconcileShopping(
       statements.push(
         stmt(
           db,
-          "UPDATE shopping_cycles SET ends_on=?,shopping_on=?,shopping_days_json=?,obsolete=0,version=? WHERE id=?",
+          `UPDATE ${cycleTable(n)} SET ends_on=?,shopping_on=?,shopping_days_json=?,obsolete=0,version=? WHERE id=?`,
           n.ends_on,
           n.shopping_on,
           n.shopping_days_json,
@@ -376,7 +400,7 @@ export async function reconcileShopping(
       statements.push(
         stmt(
           db,
-          "INSERT INTO shopping_cycles(id,starts_on,ends_on,shopping_on,status,shopping_days_json) VALUES (?,?,?,?,'review',?)",
+          `INSERT INTO ${cycleTable(n)}(id,starts_on,ends_on,shopping_on,status,shopping_days_json) VALUES (?,?,?,?,'review',?)`,
           n.id,
           n.starts_on,
           n.ends_on,
@@ -439,18 +463,18 @@ export async function reconcileShopping(
     statements.push(
       guard(
         db,
-        "EXISTS(SELECT 1 FROM shopping_cycles WHERE id=? AND version=? AND status='review' AND obsolete=0)",
+        `EXISTS(SELECT 1 FROM ${cycleTable(cycle)} WHERE id=? AND version=? AND status='review' AND obsolete=0)`,
         cycle.id,
         cycle.version,
       ),
       stmt(
         db,
-        "DELETE FROM shopping_items WHERE cycle_id=? AND ingredient_id IN (SELECT id FROM ingredients WHERE inventory_exempt=0)",
+        `DELETE FROM ${cycleItemTable(cycle)} WHERE cycle_id=? AND ingredient_id IN (SELECT id FROM ingredients WHERE inventory_exempt=0)`,
         cycle.id,
       ),
       stmt(
         db,
-        "UPDATE shopping_cycles SET version=version+1 WHERE id=?",
+        `UPDATE ${cycleTable(cycle)} SET version=version+1 WHERE id=?`,
         cycle.id,
       ),
     );
@@ -459,7 +483,7 @@ export async function reconcileShopping(
       statements.push(
         stmt(
           db,
-          "INSERT INTO shopping_items(id,cycle_id,ingredient_id,requested_amount,proposed_amount,unit,status) VALUES (?,?,?,?,?,?,'review')",
+          `INSERT INTO ${cycleItemTable(cycle)}(id,cycle_id,ingredient_id,requested_amount,proposed_amount,unit,status) VALUES (?,?,?,?,?,?,'review')`,
           crypto.randomUUID(),
           cycle.id,
           ingredient,
@@ -530,24 +554,14 @@ export async function generate(
     s.shoppingDays.includes(new Date(start + "T00:00:00Z").getUTCDay());
   const valid = catalog.filter((r) => eligible(r, s, ings));
   const virtual = new Map(stocks.map((i) => [i.id, i.quantity]));
-  const reviewCycles = await rows<Cycle>(
-    db,
-    "SELECT * FROM shopping_cycles WHERE status='review' AND obsolete=0",
-  );
+  const reviewCycles = await cycleEntries(db, "status='review' AND obsolete=0");
   for (const cycle of reviewCycles.filter(
     (c) =>
       currentSchedule(c, s.shoppingDays) &&
       c.ends_on < start &&
       c.shopping_on >= tokyoDate(),
   )) {
-    const earlierPurchases = await rows<{
-      ingredient_id: string;
-      proposed_amount: number;
-    }>(
-      db,
-      "SELECT si.* FROM shopping_items si JOIN ingredients i ON i.id=si.ingredient_id WHERE cycle_id=? AND i.inventory_exempt=0",
-      cycle.id,
-    );
+    const earlierPurchases = await cycleItems(db, cycle);
     for (const item of earlierPurchases)
       virtual.set(
         item.ingredient_id,
@@ -602,7 +616,7 @@ export async function generate(
     statements.push(
       guard(
         db,
-        "EXISTS(SELECT 1 FROM shopping_cycles WHERE id=? AND version=? AND status='review' AND obsolete=0)",
+        `EXISTS(SELECT 1 FROM ${cycleTable(c)} WHERE id=? AND version=? AND status='review' AND obsolete=0)`,
         c.id,
         c.version,
       ),
@@ -671,14 +685,12 @@ export async function generate(
       ),
     );
   }
-  const cycle = (
-    await rows<Omit<Cycle, "items">>(
-      db,
-      "SELECT * FROM shopping_cycles WHERE starts_on<=? AND ends_on>=? AND obsolete=0 ORDER BY starts_on DESC",
-      start,
-      start,
-    )
-  ).find((c) => currentSchedule(c, s.shoppingDays));
+  const cycle = (await cycleEntries(db, "obsolete=0")).find(
+    (c) =>
+      c.starts_on <= start &&
+      c.ends_on >= start &&
+      currentSchedule(c, s.shoppingDays),
+  );
   if (purchase && cycle?.status === "confirmed" && deficits.size)
     throw new DomainError(
       "PURCHASE_ALREADY_CONFIRMED",
@@ -731,10 +743,7 @@ async function candidateContext(
       recipes(db),
       plans(db),
       ingredients(db),
-      rows<Omit<Cycle, "items">>(
-        db,
-        "SELECT * FROM shopping_cycles WHERE obsolete=0",
-      ),
+      cycleEntries(db, "obsolete=0"),
       rows<{ recipe_id: string }>(
         db,
         "SELECT recipe_id FROM plan_recipe_rejections WHERE plan_id=?",
@@ -752,14 +761,16 @@ async function candidateContext(
   if (target.local_date < tokyoDate())
     throw new DomainError("PAST_DATE", "過去の献立は変更できません", 422);
   const active = cycles.filter((c) => currentSchedule(c, config.shoppingDays));
-  const cycle = active.find(
-    (c) => c.starts_on <= target.local_date && c.ends_on >= target.local_date,
-  );
+  const cycle = [...active]
+    .sort(
+      (a, b) => Number(b.status === "review") - Number(a.status === "review"),
+    )
+    .find(
+      (c) => c.starts_on <= target.local_date && c.ends_on >= target.local_date,
+    );
   const purchase =
-    cycle?.status === "confirmed"
-      ? false
-      : allowPurchase ||
-        !!(cycle?.status === "review" && cycle.shopping_on >= tokyoDate());
+    allowPurchase ||
+    !!(cycle?.status === "review" && cycle.shopping_on >= tokyoDate());
   const virtual = new Map(stocks.map((s) => [s.id, s.quantity]));
   for (const c of active.filter(
     (c) =>
@@ -767,14 +778,7 @@ async function candidateContext(
       c.ends_on < target.local_date &&
       c.shopping_on >= tokyoDate(),
   )) {
-    for (const i of await rows<{
-      ingredient_id: string;
-      proposed_amount: number;
-    }>(
-      db,
-      "SELECT si.* FROM shopping_items si JOIN ingredients i ON i.id=si.ingredient_id WHERE cycle_id=? AND i.inventory_exempt=0",
-      c.id,
-    ))
+    for (const i of await cycleItems(db, c))
       virtual.set(
         i.ingredient_id,
         (virtual.get(i.ingredient_id) ?? 0) + i.proposed_amount,
@@ -906,9 +910,10 @@ export async function selectRecipe(
     p.id === id ? { ...p, recipe, version: p.version + 1 } : p,
   );
   const newCycle =
-    context.purchase && !context.cycle
+    context.purchase && (!context.cycle || context.cycle.status === "confirmed")
       ? {
-          id: crypto.randomUUID(),
+          kind: "run" as const,
+          id: "run_" + crypto.randomUUID(),
           starts_on: context.target.local_date,
           ends_on: cycleEnd(
             context.target.local_date,
@@ -945,7 +950,7 @@ export async function selectRecipe(
     ...context.cycles.map((c) =>
       guard(
         db,
-        "EXISTS(SELECT 1 FROM shopping_cycles WHERE id=? AND version=? AND obsolete=0)",
+        `EXISTS(SELECT 1 FROM ${cycleTable(c)} WHERE id=? AND version=? AND obsolete=0)`,
         c.id,
         c.version,
       ),
@@ -982,4 +987,132 @@ export async function selectRecipe(
     ),
   ]);
   return { ok: true };
+}
+
+/** Explicit 'shop today': preserve existing dinners and all completed purchases. */
+export async function prepareShoppingToday(db: D1Database) {
+  const start = tokyoDate();
+  const [config, stocks, catalog, ps, ings, cycles] = await Promise.all([
+    settings(db),
+    inventory(db),
+    recipes(db),
+    plans(db),
+    ingredients(db),
+    cycleEntries(db),
+  ]);
+  const end = cycleEnd(start, config.shoppingDays);
+  const pending = cycles.find(
+    (c) =>
+      c.kind === "run" &&
+      c.status === "review" &&
+      c.starts_on === start &&
+      currentSchedule(c, config.shoppingDays),
+  );
+  // Keep old proposals for audit, but never project or confirm an overlapping list twice.
+  const obsoleteCycles = cycles
+    .filter(
+      (c) =>
+        c.status === "review" &&
+        !c.obsolete &&
+        c.id !== pending?.id &&
+        (!currentSchedule(c, config.shoppingDays) ||
+          c.ends_on < start ||
+          (c.starts_on <= end && c.ends_on >= start)),
+    )
+    .map((c) => c.id);
+  const nextPlans = [...ps];
+  const virtual = new Map(stocks.map((s) => [s.id, s.quantity]));
+  const deficits = new Map<string, number>();
+  const valid = catalog.filter((r) => eligible(r, config, ings));
+  const used = ps.filter((p) => p.local_date >= start).map((p) => p.recipe.id);
+  const mutations: D1PreparedStatement[] = [];
+  for (let date = start; date <= end; date = addDays(date, 1)) {
+    const existing = ps.find((p) => p.local_date === date);
+    if (existing) {
+      if (["planned", "draft"].includes(existing.status))
+        allocate(existing.recipe, virtual, deficits);
+      continue;
+    }
+    const recipe = chooseRecipe(valid, virtual, used, config, true);
+    allocate(recipe, virtual, deficits);
+    used.push(recipe.id);
+    const id = crypto.randomUUID();
+    nextPlans.push({
+      id,
+      local_date: date,
+      status: "planned",
+      version: 0,
+      recipe,
+    });
+    mutations.push(
+      stmt(
+        db,
+        "INSERT INTO meal_plans(id,local_date,status) VALUES (?,?,'planned')",
+        id,
+        date,
+      ),
+      stmt(
+        db,
+        "INSERT INTO meal_plan_dishes(id,plan_id,recipe_id) VALUES (?,?,?)",
+        crypto.randomUUID(),
+        id,
+        recipe.id,
+      ),
+    );
+  }
+  const newCycle: Omit<Cycle, "items"> | undefined = pending
+    ? undefined
+    : {
+        kind: "run",
+        id: "run_" + crypto.randomUUID(),
+        starts_on: start,
+        ends_on: end,
+        shopping_on: start,
+        status: "review",
+        version: 0,
+        obsolete: 0,
+        shopping_days_json: JSON.stringify([...config.shoppingDays].sort()),
+      };
+  const projections = await reconcileShopping(db, {
+    projectedPlans: nextPlans.sort((a, b) =>
+      a.local_date.localeCompare(b.local_date),
+    ),
+    obsoleteCycles,
+    newCycle,
+  });
+  await atomic(db, [
+    guard(
+      db,
+      "EXISTS(SELECT 1 FROM app_settings WHERE version=?)",
+      config.version,
+    ),
+    guard(db, "(SELECT COUNT(*) FROM meal_plans)=?", ps.length),
+    ...ps.map((p) =>
+      guard(
+        db,
+        "EXISTS(SELECT 1 FROM meal_plans WHERE id=? AND version=?)",
+        p.id,
+        p.version,
+      ),
+    ),
+    ...stocks.map((s) =>
+      guard(
+        db,
+        "EXISTS(SELECT 1 FROM inventory_stocks WHERE ingredient_id=? AND version=?)",
+        s.id,
+        s.version,
+      ),
+    ),
+    ...cycles.map((c) =>
+      guard(
+        db,
+        `EXISTS(SELECT 1 FROM ${cycleTable(c)} WHERE id=? AND version=?)`,
+        c.id,
+        c.version,
+      ),
+    ),
+    ...projections,
+    ...mutations,
+  ]);
+  return shopping(db, start);
 }

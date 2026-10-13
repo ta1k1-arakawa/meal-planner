@@ -158,6 +158,7 @@ export interface ShoppingItem {
   unit: string;
 }
 export interface Cycle {
+  kind?: "cycle" | "run";
   id: string;
   starts_on: string;
   ends_on: string;

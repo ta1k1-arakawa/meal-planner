@@ -118,9 +118,12 @@ beforeEach(async (context) => {
     "0003_corrections.sql",
     "0004_pantry_recipe_details.sql",
     "0005_shopping_schedule_candidates.sql",
+    "0006_anytime_shopping.sql",
   ]) {
     if (
-      (file.startsWith("0004") || file.startsWith("0005")) &&
+      (file.startsWith("0004") ||
+        file.startsWith("0005") ||
+        file.startsWith("0006")) &&
       context.task.name.startsWith("upgrades populated")
     )
       continue;
@@ -1071,6 +1074,22 @@ describe("pantry classification and recipe detail acceptance", () => {
       );
     }
     await applyMigration("0005_shopping_schedule_candidates.sql");
+    const beforeSix: Record<string, unknown[]> = {};
+    for (const table of tables)
+      beforeSix[table] = (
+        await database
+          .prepare("SELECT * FROM " + table + " ORDER BY rowid")
+          .all()
+      ).results;
+    await applyMigration("0006_anytime_shopping.sql");
+    for (const table of tables)
+      expect(
+        (
+          await database
+            .prepare("SELECT * FROM " + table + " ORDER BY rowid")
+            .all()
+        ).results,
+      ).toEqual(beforeSix[table]);
     for (const table of tables) {
       const after = (
         await database
@@ -1321,7 +1340,7 @@ describe("Issue #4 shopping schedule and candidate selection", () => {
     const insufficient = (await get<Plan[]>("/plans")).find(
       (p) => p.status === "planned",
     )!;
-    expect((await candidatePage(insufficient, true)).candidates).toEqual([]);
+    expect((await candidatePage(insufficient, false)).candidates).toEqual([]);
     await fill();
     const tables = [
       "inventory_stocks",
@@ -1631,4 +1650,255 @@ it("rejects another plan changing between candidate validation and shopping reco
     (await database.prepare("SELECT * FROM plan_recipe_rejections").all())
       .results,
   ).toEqual([]);
+});
+
+describe("Issue #6 anytime shopping", () => {
+  it.each([
+    ["2026-10-12", "2026-10-12", 1],
+    ["2026-10-16", "2026-10-16", 1],
+    ["2026-10-18", "2026-10-19", 2],
+    ["2026-10-13", "2026-10-16", 4],
+    ["2026-10-17", "2026-10-19", 3],
+  ])(
+    "prepares %s through %s in one action while preserving actual stock",
+    async (date, end, count) => {
+      await atDate(String(date));
+      const s = await get<Settings>("/settings");
+      await post("/settings", { ...s, shoppingDays: [2, 6] }, "PUT");
+      const before = await get<Stock[]>("/inventory");
+      const cycle = await post<Cycle>("/shopping/today", {});
+      expect(cycle).toMatchObject({
+        kind: "run",
+        starts_on: date,
+        shopping_on: date,
+        ends_on: end,
+        status: "review",
+        unplanned_dates: [],
+      });
+      expect(await get<Plan[]>("/plans")).toHaveLength(Number(count));
+      expect(
+        cycle.items.find((i) => i.ingredient_id === "rice")!.proposed_amount,
+      ).toBe(350 * Number(count));
+      const second = await post<Cycle>("/shopping/today", {});
+      expect(second.id).toBe(cycle.id);
+      expect(
+        second.items.map((i) => [i.ingredient_id, i.proposed_amount]),
+      ).toEqual(cycle.items.map((i) => [i.ingredient_id, i.proposed_amount]));
+      expect(await get<Stock[]>("/inventory")).toEqual(before);
+      expect(
+        (await database.prepare("SELECT * FROM operations").all()).results,
+      ).toHaveLength(0);
+      expect(
+        (
+          await database
+            .prepare(
+              "SELECT * FROM shopping_runs WHERE status='review' AND obsolete=0",
+            )
+            .all()
+        ).results,
+      ).toHaveLength(1);
+    },
+  );
+  it("allows a second real trip on the same day without rewriting or replaying the first purchase", async () => {
+    await atDate("2026-10-13");
+    const s = await get<Settings>("/settings");
+    await post("/settings", { ...s, shoppingDays: [2, 6] }, "PUT");
+    const first = await post<Cycle>("/shopping/today", {});
+    const body = await purchaseBody(first);
+    const results = await Promise.all([
+      post("/shopping/" + first.id + "/confirm", body),
+      post("/shopping/" + first.id + "/confirm", body),
+    ]);
+    expect(results[0]).toEqual(results[1]);
+    const oldRow = await database
+      .prepare("SELECT * FROM shopping_runs WHERE id=?")
+      .bind(first.id)
+      .first();
+    const oldItems = (
+      await database
+        .prepare(
+          "SELECT * FROM shopping_run_items WHERE cycle_id=? ORDER BY ingredient_id",
+        )
+        .bind(first.id)
+        .all()
+    ).results;
+    const stocks = await get<Stock[]>("/inventory");
+    expect(stocks.find((i) => i.id === "rice")!.quantity).toBe(1400);
+    const second = await post<Cycle>("/shopping/today", {});
+    expect(second.id).not.toBe(first.id);
+    expect(second.items).toEqual([]);
+    const rice = stocks.find((i) => i.id === "rice")!;
+    await post("/inventory/adjust", {
+      ingredientId: "rice",
+      delta: -20,
+      version: rice.version,
+      idempotencyKey: crypto.randomUUID(),
+    });
+    const topup = await post<Cycle>("/shopping/today", {});
+    expect(topup.id).toBe(second.id);
+    expect(topup.items).toMatchObject([
+      { ingredient_id: "rice", proposed_amount: 20 },
+    ]);
+    await post("/shopping/" + topup.id + "/confirm", await purchaseBody(topup));
+    expect(
+      (await get<Stock[]>("/inventory")).find((i) => i.id === "rice")!.quantity,
+    ).toBe(1400);
+    expect(
+      await database
+        .prepare("SELECT * FROM shopping_runs WHERE id=?")
+        .bind(first.id)
+        .first(),
+    ).toEqual(oldRow);
+    expect(
+      (
+        await database
+          .prepare(
+            "SELECT * FROM shopping_run_items WHERE cycle_id=? ORDER BY ingredient_id",
+          )
+          .bind(first.id)
+          .all()
+      ).results,
+    ).toEqual(oldItems);
+    expect(await post("/shopping/" + first.id + "/confirm", body)).toEqual(
+      results[0],
+    );
+    expect(
+      (
+        await request("/shopping/" + first.id + "/confirm", {
+          ...body,
+          idempotencyKey: crypto.randomUUID(),
+        })
+      ).status,
+    ).toBe(409);
+  });
+  it("supersedes an overlapping old review, ignores past meals, and projects later purchases once", async () => {
+    await atDate("2026-10-17");
+    const s = await get<Settings>("/settings");
+    await post("/settings", { ...s, shoppingDays: [2, 6] }, "PUT");
+    await generation();
+    const old = await get<Cycle>("/shopping/current");
+    const oldItems = (
+      await database
+        .prepare("SELECT * FROM shopping_items WHERE cycle_id=?")
+        .bind(old.id)
+        .all()
+    ).results;
+    const oldPlans = await get<Plan[]>("/plans");
+    await atDate("2026-10-18");
+    const cycle = await post<Cycle>("/shopping/today", {});
+    expect(
+      cycle.items.find((i) => i.ingredient_id === "rice")!.proposed_amount,
+    ).toBe(700);
+    expect(await get<Plan[]>("/plans")).toEqual(oldPlans);
+    expect(
+      await database
+        .prepare("SELECT obsolete,status FROM shopping_cycles WHERE id=?")
+        .bind(old.id)
+        .first(),
+    ).toEqual({ obsolete: 1, status: "review" });
+    expect(
+      (
+        await database
+          .prepare("SELECT * FROM shopping_items WHERE cycle_id=?")
+          .bind(old.id)
+          .all()
+      ).results,
+    ).toEqual(oldItems);
+    expect(
+      (
+        await request(
+          "/shopping/" + old.id + "/confirm",
+          await purchaseBody(old),
+        )
+      ).status,
+    ).toBe(409);
+    await post("/plans/generate", {
+      startDate: "2026-10-20",
+      allowPurchase: true,
+    });
+    const future = (await loadShopping(database, "2026-10-20"))!;
+    expect(
+      future.items.find((i) => i.ingredient_id === "rice")!.proposed_amount,
+    ).toBe(1400);
+    const refreshed = await get<Cycle>("/shopping/current");
+    await post(
+      "/shopping/" + refreshed.id + "/confirm",
+      await purchaseBody(refreshed),
+    );
+    expect(
+      (await loadShopping(database, "2026-10-20"))!.items.find(
+        (i) => i.ingredient_id === "rice",
+      )!.proposed_amount,
+    ).toBe(1400);
+  });
+  it("keeps planned recipes, skipped/completed dinners and meal snapshots across repeated shopping and weekday changes", async () => {
+    await atDate("2026-10-13");
+    const s = await get<Settings>("/settings");
+    await post("/settings", { ...s, shoppingDays: [2, 6] }, "PUT");
+    const first = await post<Cycle>("/shopping/today", {});
+    await post("/shopping/" + first.id + "/confirm", await purchaseBody(first));
+    const ps = await get<Plan[]>("/plans");
+    await post("/plans/" + ps[0].id + "/complete", {
+      version: ps[0].version,
+      idempotencyKey: crypto.randomUUID(),
+      items: managedItems(ps[0].recipe),
+    });
+    await post("/plans/" + ps[1].id + "/skip", { version: ps[1].version });
+    const protectedPlans = await get<Plan[]>("/plans");
+    const protectedLogs = await get("/meal-logs");
+    const stocks = await get<Stock[]>("/inventory");
+    const next = await post<Cycle>("/shopping/today", {});
+    expect(next.items).toEqual([]);
+    expect(await get<Plan[]>("/plans")).toEqual(protectedPlans);
+    expect(await get("/meal-logs")).toEqual(protectedLogs);
+    expect(await get<Stock[]>("/inventory")).toEqual(stocks);
+    const now = await get<Settings>("/settings");
+    await post(
+      "/settings",
+      { ...now, shoppingDays: [1, 5], discardPendingShopping: true },
+      "PUT",
+    );
+    expect(
+      (
+        await request(
+          "/shopping/" + next.id + "/confirm",
+          await purchaseBody(next),
+        )
+      ).status,
+    ).toBe(409);
+    expect(await get("/meal-logs")).toEqual(protectedLogs);
+    expect(await get<Stock[]>("/inventory")).toEqual(stocks);
+  });
+  it("handles concurrent preparations and conflicting confirmations with only one active trip and one stock addition", async () => {
+    await atDate("2026-10-16");
+    const s = await get<Settings>("/settings");
+    await post("/settings", { ...s, shoppingDays: [2, 6] }, "PUT");
+    const prepared = await Promise.all([
+      request("/shopping/today", {}),
+      request("/shopping/today", {}),
+    ]);
+    expect(prepared.some((r) => r.status === 200)).toBe(true);
+    expect(prepared.every((r) => [200, 409].includes(r.status))).toBe(true);
+    const cycle = await get<Cycle>("/shopping/current");
+    const body = await purchaseBody(cycle);
+    const results = await Promise.all([
+      request("/shopping/" + cycle.id + "/confirm", body),
+      request("/shopping/" + cycle.id + "/confirm", {
+        ...body,
+        idempotencyKey: crypto.randomUUID(),
+      }),
+    ]);
+    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+    expect(
+      (await get<Stock[]>("/inventory")).find((i) => i.id === "rice")!.quantity,
+    ).toBe(350);
+    expect(await get<Plan[]>("/plans")).toHaveLength(1);
+    expect(
+      (
+        await database
+          .prepare("SELECT * FROM shopping_runs WHERE status='confirmed'")
+          .all()
+      ).results,
+    ).toHaveLength(1);
+  });
 });
