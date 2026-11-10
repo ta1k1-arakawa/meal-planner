@@ -2,12 +2,17 @@ import type {
   Ingredient,
   Stock,
   Recipe,
+  RecipeSlot,
   Settings,
   Plan,
   Cycle,
   ShoppingItem,
   RecipeCandidates,
+  SlotPlan,
+  SlotPlanSlot,
+  CostSummary,
 } from "./contracts";
+import { PRICE_CAPS } from "./price-caps";
 import { recipeItem, renderInstructions } from "./recipe";
 import {
   DomainError,
@@ -16,11 +21,14 @@ import {
   cycleEnd,
   eligible,
   chooseRecipe,
+  chooseSlotRecipe,
   allocate,
   tokyoDate,
   currentSchedule,
   nextShoppingDate,
   rankRecipes,
+  slotTargetFor,
+  DEFAULT_SLOT_TARGETS,
 } from "./planner";
 export const stmt = (
   db: D1Database,
@@ -53,6 +61,28 @@ export async function settings(db: D1Database): Promise<Settings> {
       "データベースの初期化が必要です",
       503,
     );
+  // Bulking columns arrive with migration 0008. Tolerate their absence so
+  // populated pre-0008 databases still answer settings reads during upgrade.
+  const slotTargets = (() => {
+    if (!s.slot_targets_json) return DEFAULT_SLOT_TARGETS;
+    try {
+      const parsed = JSON.parse(String(s.slot_targets_json));
+      return {
+        lunch: parsed.lunch ?? DEFAULT_SLOT_TARGETS.lunch,
+        snack: parsed.snack ?? DEFAULT_SLOT_TARGETS.snack,
+        nightSnack:
+          parsed.nightSnack ??
+          parsed.night_snack ??
+          DEFAULT_SLOT_TARGETS.nightSnack,
+        morningDrink:
+          parsed.morningDrink ??
+          parsed.morning_drink ??
+          DEFAULT_SLOT_TARGETS.morningDrink,
+      };
+    } catch {
+      return DEFAULT_SLOT_TARGETS;
+    }
+  })();
   return {
     version: Number(s.version),
     dailyKcal: Number(s.daily_kcal),
@@ -64,6 +94,11 @@ export async function settings(db: D1Database): Promise<Settings> {
     equipment: JSON.parse(String(s.equipment_json)),
     allergies: JSON.parse(String(s.allergies_json)),
     excludedIngredients: JSON.parse(String(s.excluded_ingredients_json)),
+    monthlyBudgetYen:
+      s.monthly_budget_yen === undefined || s.monthly_budget_yen === null
+        ? 25000
+        : Number(s.monthly_budget_yen),
+    slotTargets,
   };
 }
 export async function recipes(db: D1Database): Promise<Recipe[]> {
@@ -86,6 +121,8 @@ export async function recipes(db: D1Database): Promise<Recipe[]> {
       );
     return {
       ...r,
+      // The slot column arrives with migration 0008; older rows are dinners.
+      slot: ((r as { slot?: RecipeSlot }).slot ?? "dinner") as RecipeSlot,
       instructions_json: renderInstructions(r.instructions_json, items),
       items,
       ...nutrition(items, ings),
@@ -290,6 +327,7 @@ export async function reconcileShopping(
   db: D1Database,
   options: {
     skipPlan?: string;
+    skipSlotPlan?: string;
     stockDeltas?: Map<string, number>;
     skipCycle?: string;
     projectedPlans?: Plan[];
@@ -304,6 +342,26 @@ export async function reconcileShopping(
     cycleEntries(db, "status='review'"),
     settings(db),
   ]);
+  // Whole-day slot plans (lunch/snack/night/morning) share the same stock and
+  // shopping deficits as dinners. The table arrives with migration 0008, so
+  // tolerate its absence on pre-0008 databases used by upgrade flows.
+  let slotPseudoPlans: Plan[] = [];
+  try {
+    const sps = await slotPlans(db);
+    slotPseudoPlans = sps
+      .filter(
+        (sp) => sp.status === "planned" && sp.id !== options.skipSlotPlan,
+      )
+      .map((sp) => ({
+        id: sp.id,
+        local_date: sp.local_date,
+        status: "planned" as const,
+        version: sp.version,
+        recipe: sp.recipe,
+      }));
+  } catch {
+    slotPseudoPlans = [];
+  }
   const config = options.settingsOverride ?? savedSettings;
   const statements: D1PreparedStatement[] = [
     guard(
@@ -437,7 +495,10 @@ export async function reconcileShopping(
     }
     const deficits = new Map<string, number>(),
       requirements = new Map<string, number>();
-    for (const p of (options.projectedPlans ?? ps).filter(
+    for (const p of [
+      ...(options.projectedPlans ?? ps),
+      ...slotPseudoPlans,
+    ].filter(
       (p) =>
         p.id !== options.skipPlan &&
         p.status === "planned" &&
@@ -552,7 +613,7 @@ export async function generate(
   const purchase =
     allowPurchase ||
     s.shoppingDays.includes(new Date(start + "T00:00:00Z").getUTCDay());
-  const valid = catalog.filter((r) => eligible(r, s, ings));
+  const valid = catalog.filter((r) => r.slot === "dinner" && eligible(r, s, ings));
   const virtual = new Map(stocks.map((i) => [i.id, i.quantity]));
   const reviewCycles = await cycleEntries(db, "status='review' AND obsolete=0");
   for (const cycle of reviewCycles.filter(
@@ -809,7 +870,7 @@ async function candidateContext(
     .filter((p) => p.id !== id && p.status !== "skipped")
     .map((p) => p.recipe.id);
   const ranked = rankRecipes(
-    catalog.filter((r) => !excluded.has(r.id) && eligible(r, config, ings)),
+    catalog.filter((r) => r.slot === "dinner" && !excluded.has(r.id) && eligible(r, config, ings)),
     virtual,
     used,
     config,
@@ -1023,7 +1084,7 @@ export async function prepareShoppingToday(db: D1Database) {
   const nextPlans = [...ps];
   const virtual = new Map(stocks.map((s) => [s.id, s.quantity]));
   const deficits = new Map<string, number>();
-  const valid = catalog.filter((r) => eligible(r, config, ings));
+  const valid = catalog.filter((r) => r.slot === "dinner" && eligible(r, config, ings));
   const used = ps.filter((p) => p.local_date >= start).map((p) => p.recipe.id);
   const mutations: D1PreparedStatement[] = [];
   for (let date = start; date <= end; date = addDays(date, 1)) {
@@ -1115,4 +1176,269 @@ export async function prepareShoppingToday(db: D1Database) {
     ...mutations,
   ]);
   return shopping(db, start);
+}
+
+export async function slotPlans(db: D1Database): Promise<SlotPlan[]> {
+  const [rs, catalog] = await Promise.all([
+    rows<Omit<SlotPlan, "recipe">>(
+      db,
+      "SELECT id, local_date, slot, status, version, recipe_id FROM meal_slot_plans ORDER BY local_date, slot",
+    ),
+    recipes(db),
+  ]);
+  const byId = new Map(catalog.map((r) => [r.id, r]));
+  return rs.map((r) => {
+    const recipe = byId.get(
+      (r as unknown as { recipe_id: string }).recipe_id,
+    );
+    if (!recipe)
+      throw new DomainError("INVALID_RECIPE", "レシピがありません", 422);
+    return {
+      id: r.id,
+      local_date: r.local_date,
+      slot: r.slot,
+      status: r.status,
+      version: r.version,
+      recipe,
+    };
+  });
+}
+
+const SLOT_ORDER: SlotPlanSlot[] = [
+  "morning_drink",
+  "lunch",
+  "snack",
+  "night_snack",
+];
+
+/**
+ * Generate the non-dinner slots for one shopping cycle. Dinner stays in
+ * meal_plans; its planned recipes reserve virtual stock here in date order.
+ * Existing slot plans are preserved, completed/skipped dinners keep their
+ * reservations out, and shopping deficits are reconciled afterwards so the
+ * shopping list covers the whole day, not only dinner.
+ */
+export async function generateDayPlans(
+  db: D1Database,
+  start: string,
+  includeMorningDrink: boolean,
+) {
+  const [s, stocks, catalog, ings, dinners, existing] = await Promise.all([
+    settings(db),
+    inventory(db),
+    recipes(db),
+    ingredients(db),
+    plans(db),
+    slotPlans(db),
+  ]);
+  const end = cycleEnd(start, s.shoppingDays);
+  // Same rule as dinner generation: purchases may be assumed on a shopping
+  // day, otherwise the day must be coverable from stock alone.
+  const allowPurchase = s.shoppingDays.includes(
+    new Date(start + "T00:00:00Z").getUTCDay(),
+  );
+  const virtual = new Map(stocks.map((i) => [i.id, i.quantity]));
+  const deficits = new Map<string, number>();
+  const reserve = (recipe: Recipe) => allocate(recipe, virtual, deficits);
+  const used: string[] = [];
+  for (const p of dinners.filter(
+    (p) =>
+      p.local_date >= tokyoDate() &&
+      p.local_date < start &&
+      ["draft", "planned"].includes(p.status),
+  )) {
+    reserve(p.recipe);
+    used.push(p.recipe.id);
+  }
+  for (const sp of existing.filter(
+    (sp) =>
+      sp.local_date >= tokyoDate() &&
+      sp.local_date < start &&
+      sp.status === "planned",
+  )) {
+    reserve(sp.recipe);
+    used.push(sp.recipe.id);
+  }
+  const slots = SLOT_ORDER.filter(
+    (slot) => includeMorningDrink || slot !== "morning_drink",
+  );
+  const inserts: D1PreparedStatement[] = [];
+  const created: { date: string; slot: SlotPlanSlot; recipe: Recipe }[] = [];
+  for (let date = start; date <= end; date = addDays(date, 1)) {
+    for (const slot of slots) {
+      const kept = existing.find(
+        (sp) => sp.local_date === date && sp.slot === slot,
+      );
+      if (kept) {
+        if (kept.status === "planned") reserve(kept.recipe);
+        used.push(kept.recipe.id);
+        if (slot === "snack") {
+          const dinner = dinners.find((p) => p.local_date === date);
+          if (dinner && ["draft", "planned"].includes(dinner.status))
+            reserve(dinner.recipe);
+        }
+        continue;
+      }
+      const recipe = chooseSlotRecipe(
+        catalog.filter((r) => r.slot === slot && eligible(r, s, ings)),
+        virtual,
+        used,
+        slotTargetFor(s, slot),
+        allowPurchase,
+      );
+      reserve(recipe);
+      used.push(recipe.id);
+      const id = crypto.randomUUID();
+      created.push({ date, slot, recipe });
+      inserts.push(
+        stmt(
+          db,
+          "INSERT INTO meal_slot_plans(id,local_date,slot,recipe_id) VALUES (?,?,?,?)",
+          id,
+          date,
+          slot,
+          recipe.id,
+        ),
+      );
+      if (slot === "snack") {
+        const dinner = dinners.find((p) => p.local_date === date);
+        if (dinner && ["draft", "planned"].includes(dinner.status))
+          reserve(dinner.recipe);
+      }
+    }
+  }
+  if (inserts.length) {
+    await atomic(db, [
+      guard(db, "EXISTS(SELECT 1 FROM app_settings WHERE version=?)", s.version),
+      guard(db, "(SELECT COUNT(*) FROM meal_slot_plans)=?", existing.length),
+      ...existing.map((sp) =>
+        guard(
+          db,
+          "EXISTS(SELECT 1 FROM meal_slot_plans WHERE id=? AND version=?)",
+          sp.id,
+          sp.version,
+        ),
+      ),
+      ...inserts,
+    ]);
+    const projections = await reconcileShopping(db);
+    await atomic(db, projections);
+  }
+  return {
+    startDate: start,
+    endDate: end,
+    created: created.length,
+    slotPlans: (await slotPlans(db)).filter(
+      (sp) => sp.local_date >= start && sp.local_date <= end,
+    ),
+  };
+}
+
+/** Latest confirmed unit price (yen per canonical unit) per ingredient. */
+export async function latestUnitPrices(db: D1Database) {
+  let priced: {
+    ingredient_id: string;
+    price_yen: number;
+    amount: number;
+    day: string;
+  }[] = [];
+  try {
+    priced = await rows(
+      db,
+      `SELECT pp.ingredient_id AS ingredient_id, pp.price_yen AS price_yen,
+              COALESCE(si.actual_amount, ri.actual_amount) AS amount,
+              COALESCE(c.shopping_on, r.shopping_on) AS day
+       FROM purchase_prices pp
+       LEFT JOIN shopping_cycles c ON c.id = pp.cycle_id
+       LEFT JOIN shopping_runs r ON r.id = pp.cycle_id
+       LEFT JOIN shopping_items si ON si.cycle_id = pp.cycle_id AND si.ingredient_id = pp.ingredient_id
+       LEFT JOIN shopping_run_items ri ON ri.cycle_id = pp.cycle_id AND ri.ingredient_id = pp.ingredient_id
+       ORDER BY day DESC`,
+    );
+  } catch {
+    priced = [];
+  }
+  const latest = new Map<string, number>();
+  for (const row of priced) {
+    if (!row.amount || latest.has(row.ingredient_id)) continue;
+    latest.set(row.ingredient_id, row.price_yen / row.amount);
+  }
+  return latest;
+}
+
+export async function costSummary(
+  db: D1Database,
+  month: string,
+): Promise<CostSummary> {
+  const config = await settings(db);
+  let spendRows: { day: string; yen: number }[] = [];
+  try {
+    spendRows = await rows(
+      db,
+      `SELECT COALESCE(c.shopping_on, r.shopping_on) AS day,
+              SUM(pp.price_yen) AS yen
+       FROM purchase_prices pp
+       LEFT JOIN shopping_cycles c ON c.id = pp.cycle_id
+       LEFT JOIN shopping_runs r ON r.id = pp.cycle_id
+       GROUP BY day ORDER BY day`,
+    );
+  } catch {
+    spendRows = [];
+  }
+  const inMonth = spendRows.filter((r) => r.day?.startsWith(month));
+  const spentYen = inMonth.reduce((sum, r) => sum + Number(r.yen ?? 0), 0);
+  const perDay = new Map<string, number>();
+  for (const r of inMonth)
+    perDay.set(r.day, (perDay.get(r.day) ?? 0) + Number(r.yen));
+  const prices = await latestUnitPrices(db);
+  const today = tokyoDate();
+  const [dinnerPlans, sps] = await Promise.all([plans(db), slotPlans(db).catch(() => [] as SlotPlan[])]);
+  const todaysRecipes: Recipe[] = [];
+  const dinner = dinnerPlans.find(
+    (p) => p.local_date === today && p.status !== "skipped",
+  );
+  if (dinner) todaysRecipes.push(dinner.recipe);
+  for (const sp of sps)
+    if (sp.local_date === today && sp.status !== "skipped")
+      todaysRecipes.push(sp.recipe);
+  let estimated = 0;
+  const unknown = new Set<string>();
+  for (const recipe of todaysRecipes)
+    for (const item of recipe.items.filter((i) => !i.inventory_exempt)) {
+      const unit = prices.get(item.ingredientId);
+      if (unit === undefined) unknown.add(item.name);
+      else estimated += item.amount * unit;
+    }
+  return {
+    month,
+    budgetYen: config.monthlyBudgetYen,
+    spentYen,
+    remainingYen: config.monthlyBudgetYen - spentYen,
+    perDayYen: [...perDay].map(([date, yen]) => ({ date, yen })),
+    today: {
+      date: today,
+      estimatedYen: Math.round(estimated),
+      unknownIngredients: [...unknown],
+    },
+    priceCaps: PRICE_CAPS,
+  };
+}
+
+/** Price rows are only written for items that carry an explicit price. */
+export function purchasePriceStatements(
+  db: D1Database,
+  cycleId: string,
+  items: { ingredientId: string; priceYen?: number }[],
+) {
+  return items
+    .filter((i) => i.priceYen !== undefined)
+    .map((i) =>
+      stmt(
+        db,
+        "INSERT INTO purchase_prices(cycle_id,ingredient_id,price_yen) VALUES (?,?,?) ON CONFLICT(cycle_id,ingredient_id) DO UPDATE SET price_yen=excluded.price_yen",
+        cycleId,
+        i.ingredientId,
+        i.priceYen!,
+      ),
+    );
 }

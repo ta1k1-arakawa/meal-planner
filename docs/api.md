@@ -114,3 +114,24 @@ Photo-first: 全pending買い物リストを在庫反映後へ再計算・versio
 追加写真はPOST /photo-importsのpurchaseIdへ元のreviewを指定。新規画像だけの一回の解析で、元のpendingと正規化品名が一致し高信頼になった行だけを補完する。元のapplied/ignored/undoneをAIで変更せず、食材量を推測しない。元の日時/レシート識別と矛盾する場合はPHOTO_RECEIPT_MISMATCH。補完前後も追記監査し、既登録量を再追加せず新たに確定したpendingだけを在庫へ反映。追加写真のclaims/試行/token記録も保持し、結果は元の購入ID/enriched:trueへ解決する。失敗した追加解析は元の購入の在庫を変えない。
 
 購入識別のread→stock snapshot間に別の写真/手動確定が入る競合も、photo_purchase_meta.versionを共有してCAS。写真のstage/補完/在庫変更と手動購入確定でversionを進め、古い識別根拠で在庫を追加させない。新しい番号付きレシートでも、既存の番号未読写真と食品が重なれば例外確認する。
+
+## 増量 v2（0008）
+
+- `GET /api/day-plans` — 昼食・間食・夜食・朝の飲み物の予定一覧
+  （`{ id, localDate, slot, recipeId, status, recipe }`）。
+- `POST /api/day-plans/generate` — `{ startDate, includeMorningDrink? }`。
+  買い物サイクル分の枠計画を生成する。在庫の仮想予約と買い物不足量は夕食と合算される。
+  既にある枠計画は上書きしない。朝の飲み物は `includeMorningDrink: true` の時だけ。
+- `POST /api/day-plans/:id/complete` — 冪等。レシピ既定量で在庫を消費し、
+  確認済み栄養として `daily_food_entries` に記録する（枠→meal_type：lunch、snack、
+  bedtime、breakfast）。
+- `POST /api/day-plans/:id/skip` — 在庫を消費せずにスキップする。
+- `GET /api/body-weight-logs` — 体重記録と7日平均・週次変化・調整提案
+  （`maintain` / `watch` / `increase` / `decrease` / `insufficient`）。
+- `POST /api/body-weight-logs` — `{ localDate, weightKg }`。日付単位で upsert。
+- `GET /api/costs/summary?month=YYYY-MM` — 月の購入支出、予算（既定25,000円）、
+  残額、日別支出、今日の献立の推定食材費、単価上限の一覧。
+- `POST /api/shopping/:id/confirm` — 各アイテムに任意の `priceYen`（合計価格）を追加できる。
+  指定した分だけ `purchase_prices` に記録され、月次集計と単価警告に使われる。
+- `GET/PUT /api/settings` — `monthlyBudgetYen` と `slotTargets`
+  （`lunch` / `snack` / `nightSnack` / `morningDrink` の kcal・protein）を追加。

@@ -8,6 +8,10 @@ import {
   eligible,
   chooseRecipe,
   nutrition,
+  rankSlotRecipes,
+  slotTargetFor,
+  weightAdvice,
+  DEFAULT_SLOT_TARGETS,
 } from "../worker/planner";
 import type { Ingredient, Recipe, Settings } from "../worker/contracts";
 const ingredients: Ingredient[] = [
@@ -37,9 +41,17 @@ const settings: Settings = {
   equipment: ["フライパン"],
   allergies: [],
   excludedIngredients: [],
+  monthlyBudgetYen: 25000,
+  slotTargets: {
+    lunch: { kcal: 1150, protein: 50 },
+    snack: { kcal: 450, protein: 18 },
+    nightSnack: { kcal: 325, protein: 13 },
+    morningDrink: { kcal: 200, protein: 7 },
+  },
 };
 const recipe: Recipe = {
   id: "rice",
+  slot: "dinner",
   title: "テスト専用レシピ",
   total_minutes: 20,
   equipment_json: '["フライパン"]',
@@ -143,5 +155,74 @@ describe("pantry is nutrition, not virtual inventory", () => {
     allocate(dish, stocks, missing);
     expect(missing.size).toBe(0);
     expect(stocks.has("oil")).toBe(false);
+  });
+});
+
+describe("bulking slot ranking", () => {
+  const snackRecipe = (id: string, amount: number, kcal: number, protein: number): Recipe => ({
+    ...recipe,
+    id,
+    slot: "snack",
+    title: id,
+    kcal,
+    protein,
+    items: [
+      {
+        ...ingredients[0],
+        ingredientId: "rice",
+        amount,
+        inventory_exempt: false,
+        kcal_per_100: kcal / (amount / 100),
+        protein_per_100: protein / (amount / 100),
+      },
+    ],
+  });
+  it("prefers the recipe closest to the slot target", () => {
+    const close = snackRecipe("close", 100, 450, 18);
+    const far = snackRecipe("far", 100, 250, 5);
+    const stock = new Map([["rice", 10000]]);
+    expect(
+      rankSlotRecipes([far, close], stock, [], DEFAULT_SLOT_TARGETS.snack, false)[0].id,
+    ).toBe("close");
+  });
+  it("maps slot names to the bulking targets and never targets breakfast", () => {
+    const s: Settings = { ...settings, slotTargets: DEFAULT_SLOT_TARGETS };
+    expect(slotTargetFor(s, "lunch")).toEqual({ kcal: 1150, protein: 50 });
+    expect(slotTargetFor(s, "snack")).toEqual({ kcal: 450, protein: 18 });
+    expect(slotTargetFor(s, "night_snack")).toEqual({ kcal: 325, protein: 13 });
+    expect(slotTargetFor(s, "morning_drink")).toEqual({ kcal: 200, protein: 7 });
+  });
+});
+
+describe("weight advice from 7-day averages", () => {
+  const logs = (weights: number[], start = "2026-10-01") =>
+    weights.map((weightKg, i) => ({ localDate: addDays(start, i), weightKg }));
+  const week = (w: number) => Array.from({ length: 7 }, () => w);
+  it("suggests +200 kcal at the night snack after two slow weeks", () => {
+    const summary = weightAdvice(logs([...week(60), ...week(60.1), ...week(60.2)]));
+    expect(summary.weeklyChangeKg).toBe(0.1);
+    expect(summary.previousWeeklyChangeKg).toBe(0.1);
+    expect(summary.advice.action).toBe("increase");
+    expect(summary.advice.deltaKcal).toBe(200);
+    expect(summary.advice.targetSlot).toBe("night_snack");
+  });
+  it("maintains inside the +0.2 to +0.4 kg/week band", () => {
+    const summary = weightAdvice(logs([...week(60), ...week(60.3), ...week(60.6)]));
+    expect(summary.advice.action).toBe("maintain");
+  });
+  it("suggests -200 kcal from the snack when gaining too fast", () => {
+    const summary = weightAdvice(logs([...week(60), ...week(60.6), ...week(61.2)]));
+    expect(summary.weeklyChangeKg).toBe(0.6);
+    expect(summary.advice.action).toBe("decrease");
+    expect(summary.advice.deltaKcal).toBe(-200);
+    expect(summary.advice.targetSlot).toBe("snack");
+  });
+  it("waits for a second week before increasing", () => {
+    const summary = weightAdvice(logs([...week(60), ...week(60.1)]));
+    expect(summary.advice.action).toBe("watch");
+  });
+  it("reports insufficient data honestly", () => {
+    expect(weightAdvice(logs([60, 60.2])).advice.action).toBe("insufficient");
+    expect(weightAdvice([]).latestWeightKg).toBeNull();
   });
 });

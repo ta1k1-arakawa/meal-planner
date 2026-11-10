@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { PriceCap } from "./price-caps";
 export const dateSchema = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/)
@@ -42,16 +43,45 @@ export const completeSchema = z
     items: itemsSchema,
   })
   .strict();
+export const purchaseItemSchema = itemSchema.extend({
+  priceYen: z.number().int().min(0).max(10000000).optional(),
+});
 export const purchaseSchema = completeSchema.extend({
   amountPolicy: z.literal("remaining").optional(),
   items: z
-    .array(itemSchema)
+    .array(purchaseItemSchema)
     .max(80)
     .refine(
       (a) => new Set(a.map((i) => i.ingredientId)).size === a.length,
       "食材が重複しています",
     ),
 });
+export const slotTargetSchema = z
+  .object({
+    kcal: z.number().int().min(0).max(2500),
+    protein: z.number().int().min(0).max(250),
+  })
+  .strict();
+export const slotTargetsSchema = z
+  .object({
+    lunch: slotTargetSchema,
+    snack: slotTargetSchema,
+    nightSnack: slotTargetSchema,
+    morningDrink: slotTargetSchema,
+  })
+  .strict();
+export const dayGenerateSchema = z
+  .object({
+    startDate: dateSchema,
+    includeMorningDrink: z.boolean().default(false),
+  })
+  .strict();
+export const weightLogSchema = z
+  .object({
+    localDate: dateSchema,
+    weightKg: z.number().min(20).max(500),
+  })
+  .strict();
 export const generateSchema = z
   .object({ startDate: dateSchema, allowPurchase: z.boolean().default(false) })
   .strict();
@@ -85,6 +115,8 @@ export const settingsSchema = z
     equipment: z.array(z.string().min(1).max(50)).max(20),
     allergies: z.array(z.string().min(1).max(50)).max(30),
     excludedIngredients: z.array(z.string().min(1).max(80)).max(80),
+    monthlyBudgetYen: z.number().int().min(1000).max(200000),
+    slotTargets: slotTargetsSchema,
     discardPendingShopping: z.boolean().default(false),
   })
   .strict();
@@ -120,9 +152,27 @@ export interface Stock extends Ingredient {
   quantity: number;
   version: number;
 }
+export type RecipeSlot =
+  | "lunch"
+  | "snack"
+  | "dinner"
+  | "night_snack"
+  | "morning_drink";
+export type SlotPlanSlot = Exclude<RecipeSlot, "dinner">;
+export interface SlotTarget {
+  kcal: number;
+  protein: number;
+}
+export interface SlotTargets {
+  lunch: SlotTarget;
+  snack: SlotTarget;
+  nightSnack: SlotTarget;
+  morningDrink: SlotTarget;
+}
 export interface Recipe {
   id: string;
   title: string;
+  slot: RecipeSlot;
   total_minutes: number;
   equipment_json: string;
   instructions_json: string;
@@ -142,6 +192,47 @@ export interface Settings {
   equipment: string[];
   allergies: string[];
   excludedIngredients: string[];
+  monthlyBudgetYen: number;
+  slotTargets: SlotTargets;
+}
+export interface SlotPlan {
+  id: string;
+  local_date: string;
+  slot: SlotPlanSlot;
+  status: "planned" | "completed" | "skipped";
+  version: number;
+  recipe: Recipe;
+}
+export interface WeightLog {
+  local_date: string;
+  weight_kg: number;
+}
+export interface WeightSummary {
+  latestWeightKg: number | null;
+  currentWeekAverageKg: number | null;
+  previousWeekAverageKg: number | null;
+  weeklyChangeKg: number | null;
+  previousWeeklyChangeKg: number | null;
+  advice: {
+    action: "increase" | "decrease" | "maintain" | "watch" | "insufficient";
+    deltaKcal: number;
+    targetSlot: "night_snack" | "snack" | null;
+    message: string;
+  };
+}
+export interface CostSummary {
+  month: string;
+  budgetYen: number;
+  spentYen: number;
+  remainingYen: number;
+  perDayYen: { date: string; yen: number }[];
+  today: {
+    date: string;
+    /** Sum over priced ingredients only; see unknownIngredients. */
+    estimatedYen: number;
+    unknownIngredients: string[];
+  };
+  priceCaps: PriceCap[];
 }
 export interface Plan {
   id: string;
