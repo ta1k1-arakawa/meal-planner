@@ -65,6 +65,52 @@ const SLOT_LABELS: Record<string, string> = {
   dinner: "夕食",
   night_snack: "夜食",
 };
+// In-progress shopping checklist state (checks, edited amounts, prices) is
+// kept on this device only, keyed by shopping cycle, so a reload mid-shop
+// does not lose it. The server contract is unchanged: on confirm, unchecked
+// items are sent with amount 0, exactly like the old "set it to 0" flow.
+const SHOP_DRAFT_PREFIX = "meal-planner:shopping-draft:";
+type ShopDraft = {
+  version: number;
+  checked: Record<string, boolean>;
+  amounts: Record<string, number>;
+  prices: Record<string, string>;
+};
+function loadShopDraft(cycle: Cycle): ShopDraft | null {
+  try {
+    const raw = localStorage.getItem(SHOP_DRAFT_PREFIX + cycle.id);
+    if (!raw) return null;
+    const draft = JSON.parse(raw) as ShopDraft;
+    return draft.version === cycle.version ? draft : null;
+  } catch {
+    return null;
+  }
+}
+function saveShopDraft(cycle: Cycle, draft: ShopDraft) {
+  try {
+    localStorage.setItem(SHOP_DRAFT_PREFIX + cycle.id, JSON.stringify(draft));
+  } catch {
+    /* Storage may be unavailable; the checklist still works in-memory. */
+  }
+}
+function clearShopDraft(cycleId: string) {
+  try {
+    localStorage.removeItem(SHOP_DRAFT_PREFIX + cycleId);
+  } catch {
+    /* ignore */
+  }
+}
+function draftHasProgress(cycle: Cycle, draft: ShopDraft): boolean {
+  return (
+    Object.values(draft.checked).some(Boolean) ||
+    Object.values(draft.prices).some((p) => p !== "") ||
+    cycle.items.some(
+      (i) =>
+        draft.amounts[i.ingredient_id] !== undefined &&
+        draft.amounts[i.ingredient_id] !== i.proposed_amount,
+    )
+  );
+}
 type WeightPayload = { logs: WeightLog[]; summary: WeightSummary };
 export function App() {
   const [logged, setLogged] = useState(false),
@@ -87,7 +133,8 @@ export function App() {
     [weight, setWeight] = useState<WeightPayload | null>(null),
     [costs, setCosts] = useState<CostSummary | null>(null),
     [weightInput, setWeightInput] = useState(""),
-    [shopPrices, setShopPrices] = useState<Record<string, string>>({});
+    [shopPrices, setShopPrices] = useState<Record<string, string>>({}),
+    [shopChecked, setShopChecked] = useState<Record<string, boolean>>({});
   const [error, setError] = useState(""),
     [message, setMessage] = useState(""),
     [operationBusy, setBusy] = useState(false);
@@ -164,14 +211,24 @@ export function App() {
       (!shoppingDirty.current || requestLock.current)
     ) {
       shoppingVersion.current = version;
-      setShopPrices({});
+      // Restore this device's in-progress checklist for the same cycle
+      // version after a reload (checks, edited amounts, prices). A draft
+      // saved under an older cycle version is stale and discarded, so a
+      // regenerated list always starts from a clean checklist.
+      const draft = sh && sh.status === "review" ? loadShopDraft(sh) : null;
+      setShopChecked(draft?.checked ?? {});
+      setShopPrices(draft?.prices ?? {});
       setShopAmounts(
         Object.fromEntries(
-          sh?.items.map((i) => [i.ingredient_id, i.proposed_amount]) ?? [],
+          sh?.items.map((i) => [
+            i.ingredient_id,
+            draft?.amounts[i.ingredient_id] ?? i.proposed_amount,
+          ]) ?? [],
         ),
       );
-      shoppingDirty.current = false;
-      setShoppingEdited(false);
+      const resumed = !!draft && !!sh && draftHasProgress(sh, draft);
+      shoppingDirty.current = resumed;
+      setShoppingEdited(resumed);
     }
     setAdjustIngredient((current) => current || st[0]?.id || "");
     // First load only: if the current cycle has not been generated yet,
@@ -210,6 +267,19 @@ export function App() {
       .finally(() => setChecking(false));
     return () => window.removeEventListener("session-expired", expired);
   }, []);
+  // Persist the in-progress shopping checklist on this device so a reload
+  // mid-shop keeps the checks, edited amounts and prices for this cycle.
+  // Only state belonging to the currently loaded cycle version is saved.
+  useEffect(() => {
+    if (!cycle || cycle.status !== "review") return;
+    if (shoppingVersion.current !== cycle.id + ":" + cycle.version) return;
+    saveShopDraft(cycle, {
+      version: cycle.version,
+      checked: shopChecked,
+      amounts: shopAmounts,
+      prices: shopPrices,
+    });
+  }, [cycle, shopChecked, shopAmounts, shopPrices]);
   async function run(
     action: () => Promise<unknown>,
     success: string,
@@ -1118,101 +1188,171 @@ export function App() {
                   </p>
                 )}
                 <p className="muted">
-                  献立全体の不足量です。写真で登録した量を含めず、まだ在庫に登録していない追加購入量だけ確定してください。購入しなかった項目は0に変更してください。
+                  献立全体の不足量です。写真で登録した量を含めず、まだ在庫に登録していない追加購入量だけ確定してください。買った品目にチェックを入れると購入量と価格を入力できます。チェックしなかった品目は購入しなかったものとして扱います。
                 </p>
                 {!!cycle.photo_registered?.length && (
                   <p className="notice">
                     写真の購入分は在庫に登録済みです。下の数量は未登録の買い足し分です。
                   </p>
                 )}
+                {cycle.status === "review" && cycle.items.length > 0 && (
+                  <p className="notice">
+                    {`${cycle.items.length}品目中${cycle.items.filter((i) => shopChecked[i.ingredient_id]).length}品目チェック済み`}
+                  </p>
+                )}
                 {cycle.items.length ? (
                   <form
                     onSubmit={(e) => {
                       e.preventDefault();
+                      // Unchecked items are not purchased: they are sent
+                      // with amount 0 and no price, exactly like the old
+                      // flow where the user zeroed them by hand.
+                      if (
+                        !cycle.items.some(
+                          (i) => shopChecked[i.ingredient_id],
+                        )
+                      )
+                        return;
                       const value = {
                         version: cycle.version,
                         amountPolicy: "remaining" as const,
-                        items: cycle.items.map((i) => ({
-                          ingredientId: i.ingredient_id,
-                          amount: shopAmounts[i.ingredient_id],
-                          ...(shopPrices[i.ingredient_id]
-                            ? {
-                                priceYen: Number(
-                                  shopPrices[i.ingredient_id],
-                                ),
-                              }
-                            : {}),
-                        })),
+                        items: cycle.items.map((i) => {
+                          const checked = !!shopChecked[i.ingredient_id];
+                          return {
+                            ingredientId: i.ingredient_id,
+                            amount: checked
+                              ? (shopAmounts[i.ingredient_id] ??
+                                i.proposed_amount)
+                              : 0,
+                            ...(checked && shopPrices[i.ingredient_id]
+                              ? {
+                                  priceYen: Number(
+                                    shopPrices[i.ingredient_id],
+                                  ),
+                                }
+                              : {}),
+                          };
+                        }),
                       };
                       run(
-                        () =>
-                          api("/shopping/" + cycle.id + "/confirm", {
-                            ...value,
-                            idempotencyKey: keyFor({
-                              cycleId: cycle.id,
+                        async () => {
+                          const result = await api(
+                            "/shopping/" + cycle.id + "/confirm",
+                            {
                               ...value,
-                            }),
-                          }),
+                              idempotencyKey: keyFor({
+                                cycleId: cycle.id,
+                                ...value,
+                              }),
+                            },
+                          );
+                          // The cycle is confirmed; its on-device draft
+                          // must not resurrect the finished checklist.
+                          clearShopDraft(cycle.id);
+                          return result;
+                        },
                         "購入を確定し、在庫に追加しました",
                       );
                     }}
                   >
                     {cycle.items.map((i) => {
                       const cap = priceCapFor(i.ingredient_id);
+                      if (cycle.status !== "review") {
+                        return (
+                          <div key={i.ingredient_id}>
+                            <label>
+                              {i.name} · 必要な買い足し {i.proposed_amount}
+                              {i.unit}
+                              <input
+                                type="number"
+                                required
+                                min="0"
+                                step="1"
+                                max="1000000"
+                                disabled
+                                value={i.actual_amount ?? 0}
+                              />
+                            </label>
+                            {cap && (
+                              <p className="muted">
+                                目安：{cap.label} {cap.limitText}
+                              </p>
+                            )}
+                          </div>
+                        );
+                      }
+                      const checked = !!shopChecked[i.ingredient_id];
                       const price = shopPrices[i.ingredient_id] ?? "";
-                      const unitPrice = price
-                        ? unitPriceYenPer100(
-                            Number(price),
-                            shopAmounts[i.ingredient_id] ?? 0,
-                          )
-                        : null;
+                      const amount =
+                        shopAmounts[i.ingredient_id] ?? i.proposed_amount;
+                      const unitPrice =
+                        checked && price
+                          ? unitPriceYenPer100(Number(price), amount)
+                          : null;
                       const overCap =
                         !!cap && unitPrice !== null && unitPrice > cap.yenPer100;
                       return (
                         <div key={i.ingredient_id}>
-                          <label>
-                            {i.name} · 必要な買い足し {i.proposed_amount}
-                            {i.unit}
+                          <label className="check">
                             <input
-                              type="number"
-                              required
-                              min="0"
-                              step="1"
-                              max="1000000"
-                              disabled={cycle.status === "confirmed"}
-                              value={
-                                cycle.status === "confirmed"
-                                  ? (i.actual_amount ?? 0)
-                                  : (shopAmounts[i.ingredient_id] ?? 0)
-                              }
+                              type="checkbox"
+                              checked={checked}
+                              disabled={busy}
                               onChange={(e) => {
                                 shoppingDirty.current = true;
                                 setShoppingEdited(true);
-                                setShopAmounts({
-                                  ...shopAmounts,
-                                  [i.ingredient_id]: Number(e.target.value),
+                                setShopChecked({
+                                  ...shopChecked,
+                                  [i.ingredient_id]: e.target.checked,
                                 });
                               }}
                             />
+                            <span>
+                              {i.name} · 必要な買い足し {i.proposed_amount}
+                              {i.unit} · 買った
+                            </span>
                           </label>
-                          {cycle.status === "review" && (
-                            <label>
-                              {i.name}の合計価格（円・任意）食費集計に使います
-                              <input
-                                type="text"
-                                inputMode="numeric"
-                                pattern="[0-9]*"
-                                value={price}
-                                onChange={(e) => {
-                                  shoppingDirty.current = true;
-                                  setShoppingEdited(true);
-                                  setShopPrices({
-                                    ...shopPrices,
-                                    [i.ingredient_id]: e.target.value,
-                                  });
-                                }}
-                              />
-                            </label>
+                          {checked && (
+                            <>
+                              <label>
+                                {i.name}の購入量（{i.unit}）
+                                <input
+                                  type="number"
+                                  required
+                                  min="0"
+                                  step="1"
+                                  max="1000000"
+                                  value={amount}
+                                  onChange={(e) => {
+                                    shoppingDirty.current = true;
+                                    setShoppingEdited(true);
+                                    setShopAmounts({
+                                      ...shopAmounts,
+                                      [i.ingredient_id]: Number(
+                                        e.target.value,
+                                      ),
+                                    });
+                                  }}
+                                />
+                              </label>
+                              <label>
+                                {i.name}の合計価格（円・任意）食費集計に使います
+                                <input
+                                  type="text"
+                                  inputMode="numeric"
+                                  pattern="[0-9]*"
+                                  value={price}
+                                  onChange={(e) => {
+                                    shoppingDirty.current = true;
+                                    setShoppingEdited(true);
+                                    setShopPrices({
+                                      ...shopPrices,
+                                      [i.ingredient_id]: e.target.value,
+                                    });
+                                  }}
+                                />
+                              </label>
+                            </>
                           )}
                           {cap && (
                             <p className="muted">
@@ -1231,9 +1371,25 @@ export function App() {
                       );
                     })}
                     {cycle.status === "review" && (
-                      <button disabled={busy}>
-                        実際の購入量を確認して確定
-                      </button>
+                      <>
+                        <button
+                          disabled={
+                            busy ||
+                            !cycle.items.some(
+                              (i) => shopChecked[i.ingredient_id],
+                            )
+                          }
+                        >
+                          実際の購入量を確認して確定
+                        </button>
+                        {!cycle.items.some(
+                          (i) => shopChecked[i.ingredient_id],
+                        ) && (
+                          <p className="muted">
+                            買った品目にチェックを入れてください。
+                          </p>
+                        )}
+                      </>
                     )}
                   </form>
                 ) : (

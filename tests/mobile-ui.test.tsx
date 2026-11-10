@@ -108,6 +108,7 @@ const response = (data: unknown, status = 200) =>
     headers: { "Content-Type": "application/json" },
   });
 beforeEach(() => {
+  localStorage.clear();
   date = "2026-10-13";
   logs = [];
   slotPlans = [];
@@ -232,6 +233,25 @@ beforeEach(() => {
             version: cycle.version + 1,
             items: [{ ...cycle.items[0], proposed_amount: 700 }],
           };
+        return response({ ok: true });
+      }
+      if (path.startsWith("/shopping/") && path.endsWith("/confirm")) {
+        if (cycle) {
+          const amounts = new Map(
+            (
+              body.items as { ingredientId: string; amount: number }[]
+            ).map((i) => [i.ingredientId, i.amount]),
+          );
+          cycle = {
+            ...cycle,
+            status: "confirmed",
+            version: cycle.version + 1,
+            items: cycle.items.map((i) => ({
+              ...i,
+              actual_amount: amounts.get(i.ingredient_id) ?? 0,
+            })),
+          };
+        }
         return response({ ok: true });
       }
       if (path === "/shopping/today") {
@@ -410,6 +430,7 @@ describe("mobile daily flows", () => {
     );
     expect(screen.getByRole("heading", { name: "料理2" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "買い物" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /ご飯/ }));
     const input = screen.getByRole("spinbutton");
     fireEvent.change(input, { target: { value: "123" } });
     const count = calls.length;
@@ -517,6 +538,126 @@ describe("bulking production fixes", () => {
   });
 });
 
+describe("shopping checklist flow", () => {
+  const draftKey = "meal-planner:shopping-draft:run_test";
+  function twoItems() {
+    cycle = {
+      ...cycle!,
+      items: [
+        {
+          ingredient_id: "rice",
+          name: "ご飯",
+          requested_amount: 350,
+          proposed_amount: 350,
+          actual_amount: null,
+          unit: "g",
+        },
+        {
+          ingredient_id: "milk",
+          name: "牛乳",
+          requested_amount: 1000,
+          proposed_amount: 1000,
+          actual_amount: null,
+          unit: "ml",
+        },
+      ],
+    };
+  }
+  it("starts unchecked with inputs hidden and confirm disabled, then reveals the needed amount on check", async () => {
+    await start();
+    fireEvent.click(screen.getByRole("button", { name: "買い物" }));
+    expect(screen.getByText("1品目中0品目チェック済み")).toBeTruthy();
+    expect(screen.queryByRole("spinbutton")).toBeNull();
+    const confirmButton = screen.getByRole("button", {
+      name: "実際の購入量を確認して確定",
+    }) as HTMLButtonElement;
+    expect(confirmButton.disabled).toBe(true);
+    expect(
+      screen.getByText("買った品目にチェックを入れてください。"),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("checkbox", { name: /ご飯/ }));
+    expect(screen.getByText("1品目中1品目チェック済み")).toBeTruthy();
+    expect((screen.getByRole("spinbutton") as HTMLInputElement).value).toBe(
+      "350",
+    );
+    expect(confirmButton.disabled).toBe(false);
+    expect(
+      screen.queryByText("買った品目にチェックを入れてください。"),
+    ).toBeNull();
+    fireEvent.click(screen.getByRole("checkbox", { name: /ご飯/ }));
+    expect(screen.queryByRole("spinbutton")).toBeNull();
+    expect(confirmButton.disabled).toBe(true);
+  });
+  it("submits the edited amount and price for checked items and 0 without price for unchecked items", async () => {
+    twoItems();
+    await start();
+    fireEvent.click(screen.getByRole("button", { name: "買い物" }));
+    expect(screen.getByText("2品目中0品目チェック済み")).toBeTruthy();
+    fireEvent.click(screen.getByRole("checkbox", { name: /ご飯/ }));
+    fireEvent.change(screen.getByRole("spinbutton"), {
+      target: { value: "500" },
+    });
+    fireEvent.change(screen.getByLabelText(/ご飯の合計価格/), {
+      target: { value: "300" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "実際の購入量を確認して確定" }),
+    );
+    await screen.findByText("購入を確定し、在庫に追加しました");
+    const confirm = calls.find((c) => c.path === "/shopping/run_test/confirm");
+    expect(confirm).toBeTruthy();
+    expect(confirm!.body).toMatchObject({
+      version: 0,
+      amountPolicy: "remaining",
+    });
+    expect(typeof confirm!.body!.idempotencyKey).toBe("string");
+    expect(confirm!.body!.items).toEqual([
+      { ingredientId: "rice", amount: 500, priceYen: 300 },
+      { ingredientId: "milk", amount: 0 },
+    ]);
+    expect(screen.getByText(/購入確定済み/)).toBeTruthy();
+  });
+  it("restores checks, amounts and prices from the on-device draft after a reload and clears the draft on confirm", async () => {
+    twoItems();
+    await start();
+    fireEvent.click(screen.getByRole("button", { name: "買い物" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /ご飯/ }));
+    fireEvent.change(screen.getByRole("spinbutton"), {
+      target: { value: "500" },
+    });
+    fireEvent.change(screen.getByLabelText(/ご飯の合計価格/), {
+      target: { value: "300" },
+    });
+    await waitFor(() => expect(localStorage.getItem(draftKey)).not.toBeNull());
+    expect(JSON.parse(localStorage.getItem(draftKey)!)).toMatchObject({
+      version: 0,
+      checked: { rice: true },
+      amounts: { rice: 500 },
+      prices: { rice: "300" },
+    });
+    cleanup();
+    render(<App />);
+    await screen.findByRole("heading", { name: "今夜の夕食" });
+    fireEvent.click(screen.getByRole("button", { name: "買い物" }));
+    expect(
+      (screen.getByRole("checkbox", { name: /ご飯/ }) as HTMLInputElement)
+        .checked,
+    ).toBe(true);
+    expect(screen.getByText("2品目中1品目チェック済み")).toBeTruthy();
+    expect((screen.getByRole("spinbutton") as HTMLInputElement).value).toBe(
+      "500",
+    );
+    expect(
+      (screen.getByLabelText(/ご飯の合計価格/) as HTMLInputElement).value,
+    ).toBe("300");
+    fireEvent.click(
+      screen.getByRole("button", { name: "実際の購入量を確認して確定" }),
+    );
+    await screen.findByText("購入を確定し、在庫に追加しました");
+    expect(localStorage.getItem(draftKey)).toBeNull();
+  });
+});
+
 it("preserves purchase quantities edited while a background read is already in flight", async () => {
   await start();
   fireEvent.click(screen.getByRole("button", { name: "買い物" }));
@@ -525,6 +666,7 @@ it("preserves purchase quantities edited while a background read is already in f
     resolve = r;
   });
   fireEvent(window, new Event("focus"));
+  fireEvent.click(screen.getByRole("checkbox", { name: /ご飯/ }));
   const input = screen.getByRole("spinbutton") as HTMLInputElement;
   fireEvent.change(input, { target: { value: "123" } });
   cycle = {
