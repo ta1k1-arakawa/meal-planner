@@ -1,5 +1,17 @@
 # Dinner Planner — Product / Technical Specification v1.5
 
+> **Scope change (bulking v2, 2026-11-10):** the app now plans the whole day for the
+> owner's bulking profile instead of dinners only. Migration `0008_bulking.sql` sets the
+> daily target to 3,000 kcal / 120 g protein with slot targets lunch 1,150/50,
+> afternoon snack 450/18, dinner 1,100/50, night snack 325/13, plus an optional
+> drink-only morning slot (200/7). There is no breakfast slot and no solid breakfast.
+> Lunch/snack/night/morning plans live in `meal_slot_plans`; dinners remain in
+> `meal_plans`. Weight logging with a 7-day-average adjustment rule, purchase-price
+> recording, a ¥25,000 monthly budget with per-ingredient price caps, and a
+> disliked-ingredients exclusion (default oatmeal, peanut butter) are implemented.
+> See `docs/bulking-v2.md`. Everything below remains in force where it does not
+> conflict with this note.
+
 ## Scope and operating assumptions
 
 Personal Japanese mobile-first PWA. Automatically schedule dinners only. Shopping on any day; two configurable weekdays are recommended cycle boundaries. One-person portions. Up to 30 minutes including prep. Run without a personal PC via Cloudflare Workers, D1 and static app deployment. Require access control. Target minimal ongoing cost; external vision AI may incur costs.

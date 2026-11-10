@@ -9,7 +9,15 @@ import type {
   MealLog,
   Settings,
   NutritionSummary,
+  SlotPlan,
+  WeightLog,
+  WeightSummary,
+  CostSummary,
 } from "../worker/contracts";
+import {
+  priceCapFor,
+  unitPriceYenPer100,
+} from "../worker/price-caps";
 import { RecipeDetails } from "./RecipeDetails";
 import { RecipeCandidatePicker } from "./RecipeCandidatePicker";
 import { useAutoRefresh } from "./useAutoRefresh";
@@ -49,6 +57,14 @@ async function api<T>(
   return data as T;
 }
 const number = (n: number) => Math.round(n * 10) / 10;
+const SLOT_LABELS: Record<string, string> = {
+  morning_drink: "朝の飲み物（任意）",
+  lunch: "昼食",
+  snack: "間食",
+  dinner: "夕食",
+  night_snack: "夜食",
+};
+type WeightPayload = { logs: WeightLog[]; summary: WeightSummary };
 export function App() {
   const [logged, setLogged] = useState(false),
     [checking, setChecking] = useState(true),
@@ -66,6 +82,11 @@ export function App() {
     plan: Plan | null;
     nutrition: NutritionSummary;
   } | null>(null);
+  const [dayPlans, setDayPlans] = useState<SlotPlan[]>([]),
+    [weight, setWeight] = useState<WeightPayload | null>(null),
+    [costs, setCosts] = useState<CostSummary | null>(null),
+    [weightInput, setWeightInput] = useState(""),
+    [shopPrices, setShopPrices] = useState<Record<string, string>>({});
   const [error, setError] = useState(""),
     [message, setMessage] = useState(""),
     [operationBusy, setBusy] = useState(false);
@@ -116,6 +137,16 @@ export function App() {
       api<Ingredient[]>("/ingredients"),
       api<Recipe[]>("/recipes"),
     ]);
+    // Bulking panels are additive: an older deployment without these routes
+    // must not break the core dinner flow.
+    const [dp, wt, co] = await Promise.all([
+      api<SlotPlan[]>("/day-plans").catch(() => [] as SlotPlan[]),
+      api<WeightPayload>("/body-weight-logs").catch(() => null),
+      api<CostSummary>("/costs/summary").catch(() => null),
+    ]);
+    setDayPlans(dp);
+    setWeight(wt);
+    setCosts(co);
     setStocks(st);
     setIngredients(ing);
     setCatalog(recipes);
@@ -131,6 +162,7 @@ export function App() {
       (!shoppingDirty.current || requestLock.current)
     ) {
       shoppingVersion.current = version;
+      setShopPrices({});
       setShopAmounts(
         Object.fromEntries(
           sh?.items.map((i) => [i.ingredient_id, i.proposed_amount]) ?? [],
@@ -246,6 +278,80 @@ export function App() {
   const upcomingPlans = plans.filter(
     (p) => p.local_date >= (today?.date ?? "9999-99-99"),
   );
+  const upcomingDayPlans = dayPlans.filter(
+    (p) => p.local_date >= (today?.date ?? "9999-99-99"),
+  );
+  function slotCard(sp: SlotPlan) {
+    return (
+      <article key={sp.id} className="card">
+        <div className="row">
+          <span>
+            {sp.local_date} · {SLOT_LABELS[sp.slot]}
+          </span>
+          <span className={"badge " + sp.status}>
+            {
+              {
+                planned: "予定",
+                completed: "食べた",
+                skipped: "スキップ",
+              }[sp.status]
+            }
+          </span>
+        </div>
+        <h3>{sp.recipe.title}</h3>
+        <p className="metrics">
+          約{number(sp.recipe.kcal)} kcal · たんぱく質{" "}
+          {number(sp.recipe.protein)} g · {sp.recipe.total_minutes}分
+        </p>
+        {sp.status === "planned" && (
+          <div className="actions">
+            <button
+              disabled={busy || sp.local_date > (today?.date ?? "")}
+              onClick={() => {
+                const value = {
+                  version: sp.version,
+                  items: sp.recipe.items
+                    .filter((i) => !i.inventory_exempt)
+                    .map((i) => ({
+                      ingredientId: i.ingredientId,
+                      amount: i.amount,
+                    })),
+                };
+                run(
+                  () =>
+                    api("/day-plans/" + sp.id + "/complete", {
+                      ...value,
+                      idempotencyKey: keyFor({
+                        slotPlanId: sp.id,
+                        ...value,
+                      }),
+                    }),
+                  "記録し、使用分の在庫を消費しました",
+                );
+              }}
+            >
+              レシピ通りに食べて完了
+            </button>
+            <button
+              className="secondary"
+              disabled={busy}
+              onClick={() =>
+                run(
+                  () =>
+                    api("/day-plans/" + sp.id + "/skip", {
+                      version: sp.version,
+                    }),
+                  "スキップしました。在庫は消費していません",
+                )
+              }
+            >
+              スキップ
+            </button>
+          </div>
+        )}
+      </article>
+    );
+  }
   const selected = stocks.find((s) => s.id === adjustIngredient);
   function closeCandidates(id: string) {
     returnFocus.current = id;
@@ -570,6 +676,103 @@ export function App() {
                 プリセットは食べた記録ではありません。昼食などが未記録の場合、1日の摂取量は未確定です。
               </p>
             </section>
+            <h2>昼・間食・夜食（増量）</h2>
+            <p className="muted">
+              朝食はなしが前提です。昼・間食・夜・夜食で1日分を組みます。朝は飲める日だけ、任意の飲み物枠を使えます。
+            </p>
+            {upcomingDayPlans.filter((sp) => sp.local_date === today?.date)
+              .length ? (
+              upcomingDayPlans
+                .filter((sp) => sp.local_date === today?.date)
+                .map(slotCard)
+            ) : (
+              <section className="generate">
+                <button
+                  disabled={busy}
+                  onClick={() =>
+                    run(
+                      () =>
+                        api("/day-plans/generate", {
+                          startDate: today?.date,
+                          includeMorningDrink: false,
+                        }),
+                      "昼・間食・夜食を作成しました。買い物タブで不足分を確認できます",
+                    )
+                  }
+                >
+                  昼・間食・夜食を作る
+                </button>
+              </section>
+            )}
+            <section className="card">
+              <h2>体重（7日平均）</h2>
+              {weight?.summary.latestWeightKg !== null &&
+              weight?.summary.latestWeightKg !== undefined ? (
+                <>
+                  <p>
+                    最新 {weight.summary.latestWeightKg} kg · 7日平均{" "}
+                    {weight.summary.currentWeekAverageKg ?? "—"} kg（前週平均{" "}
+                    {weight.summary.previousWeekAverageKg ?? "—"} kg）
+                  </p>
+                  <p className="notice">{weight.summary.advice.message}</p>
+                </>
+              ) : (
+                <p className="muted">
+                  毎朝、起床後トイレのあとに測って記録してください。7日平均で増量ペースを判定します。
+                </p>
+              )}
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (!today || !weightInput) return;
+                  run(
+                    () =>
+                      api("/body-weight-logs", {
+                        localDate: today.date,
+                        weightKg: Number(weightInput),
+                      }),
+                    "体重を記録しました",
+                  );
+                }}
+              >
+                <label>
+                  今日の体重 kg
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="20"
+                    max="500"
+                    value={weightInput}
+                    onChange={(e) => setWeightInput(e.target.value)}
+                  />
+                </label>
+                <button disabled={busy || !weightInput}>記録する</button>
+              </form>
+            </section>
+            <section className="card">
+              <h2>今月の食費</h2>
+              {costs ? (
+                <>
+                  <p>
+                    {costs.month}：{costs.spentYen.toLocaleString()}円 / 予算{" "}
+                    {costs.budgetYen.toLocaleString()}円（残り{" "}
+                    {costs.remainingYen.toLocaleString()}円）
+                  </p>
+                  <p className="muted">
+                    今日の献立の食材費の目安：
+                    {costs.today.estimatedYen.toLocaleString()}円
+                    {costs.today.unknownIngredients.length
+                      ? `（価格未記録：${costs.today.unknownIngredients.join("・")}）`
+                      : ""}
+                  </p>
+                  <p className="muted">
+                    価格は買い物確定時に入力した分だけ集計します。
+                  </p>
+                </>
+              ) : (
+                <p className="muted">食費集計は利用できません。</p>
+              )}
+            </section>
           </>
         )}
         {screen === "献立" && (
@@ -580,6 +783,14 @@ export function App() {
             ) : (
               <p className="empty">献立を生成して始めましょう。</p>
             )}
+            <h2>昼・間食・夜食の予定</h2>
+            {upcomingDayPlans.length ? (
+              upcomingDayPlans.map(slotCard)
+            ) : (
+              <p className="empty">
+                今日画面の「昼・間食・夜食を作る」で、次の買い物日前日までの分を作成します。
+              </p>
+            )}
           </>
         )}
         {screen === "レシピ" && (
@@ -588,7 +799,9 @@ export function App() {
             <h2>レシピ一覧（{catalog.length}件）</h2>
             {catalog.map((recipe) => (
               <details key={recipe.id} className="card">
-                <summary>{recipe.title}</summary>
+                <summary>
+                  {recipe.title}（{SLOT_LABELS[recipe.slot] ?? "夕食"}）
+                </summary>
                 <p className="metrics">
                   約{number(recipe.kcal)} kcal · たんぱく質{" "}
                   {number(recipe.protein)} g · {recipe.total_minutes}分
@@ -847,6 +1060,13 @@ export function App() {
                         items: cycle.items.map((i) => ({
                           ingredientId: i.ingredient_id,
                           amount: shopAmounts[i.ingredient_id],
+                          ...(shopPrices[i.ingredient_id]
+                            ? {
+                                priceYen: Number(
+                                  shopPrices[i.ingredient_id],
+                                ),
+                              }
+                            : {}),
                         })),
                       };
                       run(
@@ -862,33 +1082,79 @@ export function App() {
                       );
                     }}
                   >
-                    {cycle.items.map((i) => (
-                      <label key={i.ingredient_id}>
-                        {i.name} · 必要な買い足し {i.proposed_amount}
-                        {i.unit}
-                        <input
-                          type="number"
-                          required
-                          min="0"
-                          step="1"
-                          max="1000000"
-                          disabled={cycle.status === "confirmed"}
-                          value={
-                            cycle.status === "confirmed"
-                              ? (i.actual_amount ?? 0)
-                              : (shopAmounts[i.ingredient_id] ?? 0)
-                          }
-                          onChange={(e) => {
-                            shoppingDirty.current = true;
-                            setShoppingEdited(true);
-                            setShopAmounts({
-                              ...shopAmounts,
-                              [i.ingredient_id]: Number(e.target.value),
-                            });
-                          }}
-                        />
-                      </label>
-                    ))}
+                    {cycle.items.map((i) => {
+                      const cap = priceCapFor(i.ingredient_id);
+                      const price = shopPrices[i.ingredient_id] ?? "";
+                      const unitPrice = price
+                        ? unitPriceYenPer100(
+                            Number(price),
+                            shopAmounts[i.ingredient_id] ?? 0,
+                          )
+                        : null;
+                      const overCap =
+                        !!cap && unitPrice !== null && unitPrice > cap.yenPer100;
+                      return (
+                        <div key={i.ingredient_id}>
+                          <label>
+                            {i.name} · 必要な買い足し {i.proposed_amount}
+                            {i.unit}
+                            <input
+                              type="number"
+                              required
+                              min="0"
+                              step="1"
+                              max="1000000"
+                              disabled={cycle.status === "confirmed"}
+                              value={
+                                cycle.status === "confirmed"
+                                  ? (i.actual_amount ?? 0)
+                                  : (shopAmounts[i.ingredient_id] ?? 0)
+                              }
+                              onChange={(e) => {
+                                shoppingDirty.current = true;
+                                setShoppingEdited(true);
+                                setShopAmounts({
+                                  ...shopAmounts,
+                                  [i.ingredient_id]: Number(e.target.value),
+                                });
+                              }}
+                            />
+                          </label>
+                          {cycle.status === "review" && (
+                            <label>
+                              {i.name}の合計価格（円・任意）食費集計に使います
+                              <input
+                                type="text"
+                                inputMode="numeric"
+                                pattern="[0-9]*"
+                                value={price}
+                                onChange={(e) => {
+                                  shoppingDirty.current = true;
+                                  setShoppingEdited(true);
+                                  setShopPrices({
+                                    ...shopPrices,
+                                    [i.ingredient_id]: e.target.value,
+                                  });
+                                }}
+                              />
+                            </label>
+                          )}
+                          {cap && (
+                            <p className="muted">
+                              目安：{cap.label} {cap.limitText}
+                              {unitPrice !== null &&
+                                `（入力単価は100${i.unit}あたり約${unitPrice}円）`}
+                            </p>
+                          )}
+                          {overCap && (
+                            <p role="alert" className="error">
+                              {cap.label}が上限（{cap.limitText}
+                              ）を超えています。特売・冷凍まとめ買いや、米が高い時はパスタへの置換を検討してください。
+                            </p>
+                          )}
+                        </div>
+                      );
+                    })}
                     {cycle.status === "review" && (
                       <button disabled={busy}>
                         実際の購入量を確認して確定
@@ -909,6 +1175,7 @@ export function App() {
         {screen === "設定" && settings && (
           <SettingsForm
             settings={settings}
+            ingredients={ingredients}
             busy={busy}
             save={(value) =>
               run(async () => {
@@ -934,7 +1201,7 @@ export function App() {
           />
         )}
         <footer>
-          <p>夕食のみ自動計画 · 栄養は概算</p>
+          <p>朝食なし・昼／間食／夕食／夜食を自動計画 · 栄養は概算</p>
           <button
             className="secondary"
             disabled={busy}
@@ -958,10 +1225,12 @@ export function App() {
 }
 function SettingsForm({
   settings,
+  ingredients,
   busy,
   save,
 }: {
   settings: Settings;
+  ingredients: Ingredient[];
   busy: boolean;
   save: (s: Settings & { discardPendingShopping?: boolean }) => void;
 }) {
@@ -975,6 +1244,16 @@ function SettingsForm({
     ["dinnerKcal", "夕食の目標 kcal"],
     ["dinnerProtein", "夕食の目標たんぱく質 g"],
     ["maxMinutes", "調理時間の上限（30分まで）"],
+    ["monthlyBudgetYen", "月の食費予算 円"],
+  ];
+  const slotFields: [
+    keyof Settings["slotTargets"],
+    string,
+  ][] = [
+    ["lunch", "昼食"],
+    ["snack", "間食"],
+    ["nightSnack", "夜食"],
+    ["morningDrink", "朝の飲み物（任意）"],
   ];
   return (
     <section className="card">
@@ -1005,13 +1284,70 @@ function SettingsForm({
             <input
               type="number"
               min="1"
-              max={key === "maxMinutes" ? 30 : 6000}
+              max={
+                key === "maxMinutes"
+                  ? 30
+                  : key === "monthlyBudgetYen"
+                    ? 200000
+                    : 6000
+              }
               required
               value={Number(s[key])}
               onChange={(e) => setS({ ...s, [key]: Number(e.target.value) })}
             />
           </label>
         ))}
+        <fieldset>
+          <legend>食事枠ごとの目標（朝食はなし）</legend>
+          {slotFields.map(([key, label]) => (
+            <div key={key}>
+              <label>
+                {label} kcal
+                <input
+                  type="number"
+                  min="0"
+                  max="2500"
+                  required
+                  value={s.slotTargets[key].kcal}
+                  onChange={(e) =>
+                    setS({
+                      ...s,
+                      slotTargets: {
+                        ...s.slotTargets,
+                        [key]: {
+                          ...s.slotTargets[key],
+                          kcal: Number(e.target.value),
+                        },
+                      },
+                    })
+                  }
+                />
+              </label>
+              <label>
+                {label} たんぱく質 g
+                <input
+                  type="number"
+                  min="0"
+                  max="250"
+                  required
+                  value={s.slotTargets[key].protein}
+                  onChange={(e) =>
+                    setS({
+                      ...s,
+                      slotTargets: {
+                        ...s.slotTargets,
+                        [key]: {
+                          ...s.slotTargets[key],
+                          protein: Number(e.target.value),
+                        },
+                      },
+                    })
+                  }
+                />
+              </label>
+            </div>
+          ))}
+        </fieldset>
         <fieldset>
           <legend>まとめ買いの目安（2曜日）</legend>
           <p className="muted">
@@ -1055,6 +1391,29 @@ function SettingsForm({
                 }
               />
               {v}
+            </label>
+          ))}
+        </fieldset>
+        <fieldset>
+          <legend>苦手な食材（献立生成から除外）</legend>
+          <p className="muted">
+            初期設定ではオートミールとピーナッツバターを除外しています。
+          </p>
+          {ingredients.map((ing) => (
+            <label className="check" key={ing.id}>
+              <input
+                type="checkbox"
+                checked={s.excludedIngredients.includes(ing.id)}
+                onChange={(e) =>
+                  setS({
+                    ...s,
+                    excludedIngredients: e.target.checked
+                      ? [...s.excludedIngredients, ing.id]
+                      : s.excludedIngredients.filter((x) => x !== ing.id),
+                  })
+                }
+              />
+              {ing.name}
             </label>
           ))}
         </fieldset>

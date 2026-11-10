@@ -12,9 +12,12 @@ import {
   selectRecipeSchema,
   settingsSchema,
   dateSchema,
+  dayGenerateSchema,
+  weightLogSchema,
   type RecipeItem,
   type AmountItem,
   type NutritionSummary,
+  type SlotPlanSlot,
 } from "./contracts";
 import {
   DomainError,
@@ -25,6 +28,7 @@ import {
   nextShoppingDate,
   cycleEnd,
   currentSchedule,
+  weightAdvice,
 } from "./planner";
 import * as db from "./db";
 import { actualItems, recipeItem } from "./recipe";
@@ -564,6 +568,9 @@ app.post("/api/shopping/:id/confirm", async (c) => {
       c.env.DB,
       "UPDATE photo_purchase_meta SET version=version+1 WHERE id=1",
     ),
+    // Prices are recorded only when the client sends them (migration 0008).
+    // Legacy confirmations without priceYen keep working on older schemas.
+    ...db.purchasePriceStatements(c.env.DB, id, b.items),
     ...projections,
     db.guard(
       c.env.DB,
@@ -875,7 +882,7 @@ app.put("/api/settings", async (c) => {
     ),
     db.stmt(
       c.env.DB,
-      "UPDATE app_settings SET version=version+1,daily_kcal=?,daily_protein_g=?,dinner_kcal=?,dinner_protein_g=?,max_minutes=?,shopping_days_json=?,equipment_json=?,allergies_json=?,excluded_ingredients_json=? WHERE id=1",
+      "UPDATE app_settings SET version=version+1,daily_kcal=?,daily_protein_g=?,dinner_kcal=?,dinner_protein_g=?,max_minutes=?,shopping_days_json=?,equipment_json=?,allergies_json=?,excluded_ingredients_json=?,monthly_budget_yen=?,slot_targets_json=? WHERE id=1",
       s.dailyKcal,
       s.dailyProtein,
       s.dinnerKcal,
@@ -885,6 +892,8 @@ app.put("/api/settings", async (c) => {
       JSON.stringify(s.equipment),
       JSON.stringify(s.allergies),
       JSON.stringify(s.excludedIngredients),
+      s.monthlyBudgetYen,
+      JSON.stringify(s.slotTargets),
     ),
   ]);
   return c.json(await db.settings(c.env.DB));
@@ -909,6 +918,17 @@ async function dailyNutrition(
   const plan = (await db.plans(database)).find(
     (p) => p.local_date === date && p.status === "planned",
   );
+  // Whole-day slot plans (migration 0008): planned slots are projections.
+  // Completed slots are written to daily_food_entries on completion, so they
+  // arrive as confirmed entries above and are never double-counted.
+  let daySlotPlans: Awaited<ReturnType<typeof db.slotPlans>> = [];
+  try {
+    daySlotPlans = (await db.slotPlans(database)).filter(
+      (sp) => sp.local_date === date,
+    );
+  } catch {
+    daySlotPlans = [];
+  }
   const presets = await db.rows<{
     id: string;
     kind: string;
@@ -929,11 +949,23 @@ async function dailyNutrition(
     target.kcal += entry.kcal;
     target.protein += entry.protein_g;
   }
-  for (const preset of presets)
+  for (const sp of daySlotPlans)
+    if (sp.status === "planned") {
+      projected.kcal += sp.recipe.kcal;
+      projected.protein += sp.recipe.protein;
+    }
+  for (const preset of presets) {
+    // A night-snack slot plan supersedes the bedtime shake preset.
+    if (
+      preset.kind === "bedtime" &&
+      daySlotPlans.some((sp) => sp.slot === "night_snack")
+    )
+      continue;
     if (!entries.some((e) => e.meal_type === preset.kind)) {
       projected.kcal += preset.kcal;
       projected.protein += preset.protein_g;
     }
+  }
   const unknown = ["breakfast", "lunch", "snack", "bedtime"].filter(
     (type) =>
       !entries.some((e) => e.meal_type === type && e.status === "confirmed"),
@@ -985,6 +1017,174 @@ app.put("/api/daily-food-entries/:date", async (c) => {
     ),
   ]);
   return c.json(await dailyNutrition(c.env.DB, date));
+});
+const SLOT_MEAL_TYPE: Record<SlotPlanSlot, string> = {
+  lunch: "lunch",
+  snack: "snack",
+  night_snack: "bedtime",
+  morning_drink: "breakfast",
+};
+app.get("/api/day-plans", async (c) => c.json(await db.slotPlans(c.env.DB)));
+app.post("/api/day-plans/generate", async (c) => {
+  const b = dayGenerateSchema.parse(await c.req.json());
+  if (b.startDate < tokyoDate() || b.startDate > addDays(tokyoDate(), 7))
+    throw new DomainError(
+      "INVALID_DATE",
+      "今日から7日以内の日付を指定してください",
+      422,
+    );
+  return c.json(
+    await db.generateDayPlans(c.env.DB, b.startDate, b.includeMorningDrink),
+  );
+});
+app.post("/api/day-plans/:id/complete", async (c) => {
+  const body = completeSchema.parse(await c.req.json());
+  const slotPlanId = c.req.param("id");
+  const payload = JSON.stringify({ slotPlanId, ...body });
+  const old = await db.replay(
+    c.env.DB,
+    body.idempotencyKey,
+    "complete",
+    payload,
+  );
+  if (old) return c.json({ ok: true, slotPlanId: old, replayed: true });
+  const [sps, ings, stock] = await Promise.all([
+    db.slotPlans(c.env.DB),
+    db.ingredients(c.env.DB),
+    db.inventory(c.env.DB),
+  ]);
+  const sp = sps.find((p) => p.id === slotPlanId);
+  if (!sp) throw new DomainError("NOT_FOUND", "献立がありません", 404);
+  if (sp.status !== "planned" || sp.version !== body.version)
+    throw new DomainError(
+      "PLAN_CONFLICT",
+      "この献立は更新済みか完了しています",
+      409,
+    );
+  if (sp.local_date > tokyoDate())
+    throw new DomainError("FUTURE_MEAL", "未来の食事はまだ完了できません", 422);
+  const items = actualItems(body.items, sp.recipe.items, ings);
+  const shortages = body.items.filter(
+    (i) =>
+      i.amount > (stock.find((s) => s.id === i.ingredientId)?.quantity ?? 0),
+  );
+  if (shortages.length)
+    throw new DomainError(
+      "INSUFFICIENT_STOCK",
+      "在庫が不足しています。在庫補正または使用量を変更してください",
+      409,
+      shortages,
+    );
+  const totals = nutrition(items, ings);
+  const projections = await db.reconcileShopping(c.env.DB, {
+    skipSlotPlan: slotPlanId,
+    stockDeltas: new Map(body.items.map((i) => [i.ingredientId, -i.amount])),
+  });
+  const statements = [
+    ...projections,
+    db.guard(
+      c.env.DB,
+      "EXISTS(SELECT 1 FROM meal_slot_plans WHERE id=? AND version=? AND status='planned')",
+      slotPlanId,
+      body.version,
+    ),
+    db.stmt(
+      c.env.DB,
+      "UPDATE meal_slot_plans SET status='completed',version=version+1 WHERE id=?",
+      slotPlanId,
+    ),
+    db.stmt(
+      c.env.DB,
+      "INSERT INTO daily_food_entries(id,local_date,meal_type,source,status,kcal,protein_g) VALUES (?,?,?,'manual','confirmed',?,?) ON CONFLICT(local_date,meal_type) DO UPDATE SET status='confirmed',kcal=excluded.kcal,protein_g=excluded.protein_g,source='manual',preset_id=NULL",
+      crypto.randomUUID(),
+      sp.local_date,
+      SLOT_MEAL_TYPE[sp.slot],
+      totals.kcal,
+      totals.protein,
+    ),
+    ...items
+      .filter(
+        (item) =>
+          item.amount &&
+          ings.find((i) => i.id === item.ingredientId)?.inventory_exempt !== 1,
+      )
+      .map((item) =>
+        db.movement(
+          c.env.DB,
+          item.ingredientId,
+          -item.amount,
+          "meal_consumption",
+          slotPlanId,
+          body.idempotencyKey,
+        ),
+      ),
+  ];
+  const result = await db.idempotentBatch(
+    c.env.DB,
+    body.idempotencyKey,
+    "complete",
+    payload,
+    slotPlanId,
+    statements,
+  );
+  return c.json({ ok: true, slotPlanId: result, totals });
+});
+app.post("/api/day-plans/:id/skip", async (c) => {
+  const { version } = versionSchema.parse(await c.req.json());
+  const id = c.req.param("id");
+  const projections = await db.reconcileShopping(c.env.DB, {
+    skipSlotPlan: id,
+  });
+  await db.atomic(c.env.DB, [
+    ...projections,
+    db.guard(
+      c.env.DB,
+      "EXISTS(SELECT 1 FROM meal_slot_plans WHERE id=? AND version=? AND status='planned')",
+      id,
+      version,
+    ),
+    db.stmt(
+      c.env.DB,
+      "UPDATE meal_slot_plans SET status='skipped',version=version+1 WHERE id=?",
+      id,
+    ),
+  ]);
+  return c.json({ ok: true });
+});
+async function weightPayload(database: D1Database) {
+  const logs = await db.rows<{ local_date: string; weight_kg: number }>(
+    database,
+    "SELECT local_date, weight_kg FROM body_weight_logs ORDER BY local_date",
+  );
+  return {
+    logs,
+    summary: weightAdvice(
+      logs.map((l) => ({ localDate: l.local_date, weightKg: l.weight_kg })),
+    ),
+  };
+}
+app.get("/api/body-weight-logs", async (c) =>
+  c.json(await weightPayload(c.env.DB)),
+);
+app.post("/api/body-weight-logs", async (c) => {
+  const b = weightLogSchema.parse(await c.req.json());
+  await db.atomic(c.env.DB, [
+    db.stmt(
+      c.env.DB,
+      "INSERT INTO body_weight_logs(id,local_date,weight_kg) VALUES (?,?,?) ON CONFLICT(local_date) DO UPDATE SET weight_kg=excluded.weight_kg",
+      crypto.randomUUID(),
+      b.localDate,
+      b.weightKg,
+    ),
+  ]);
+  return c.json(await weightPayload(c.env.DB));
+});
+app.get("/api/costs/summary", async (c) => {
+  const month = z
+    .string()
+    .regex(/^\d{4}-\d{2}$/)
+    .parse(c.req.query("month") ?? tokyoDate().slice(0, 7));
+  return c.json(await db.costSummary(c.env.DB, month));
 });
 app.get("/api/today", async (c) => {
   const date = tokyoDate();

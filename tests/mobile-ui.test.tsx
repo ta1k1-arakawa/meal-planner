@@ -20,6 +20,7 @@ import type {
 
 const recipes: Recipe[] = Array.from({ length: 30 }, (_, n) => ({
   id: "recipe-" + n,
+  slot: "dinner" as const,
   title: "料理" + n,
   total_minutes: 20,
   equipment_json: '["フライパン"]',
@@ -53,6 +54,13 @@ const settings: Settings = {
   equipment: ["フライパン"],
   allergies: [],
   excludedIngredients: [],
+  monthlyBudgetYen: 25000,
+  slotTargets: {
+    lunch: { kcal: 1150, protein: 50 },
+    snack: { kcal: 450, protein: 18 },
+    nightSnack: { kcal: 325, protein: 13 },
+    morningDrink: { kcal: 200, protein: 7 },
+  },
 };
 let plans: Plan[], logs: MealLog[], cycle: Cycle | null, date: string;
 let conflict: boolean, delay: Promise<void> | undefined;
