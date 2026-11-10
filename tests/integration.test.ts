@@ -87,6 +87,22 @@ async function generation(allowPurchase = true) {
   await post("/plans/generate", { startDate: tokyoDate(), allowPurchase });
   return get<Plan[]>("/plans");
 }
+// Logs in with whatever clock is currently active (real or fake) and
+// replaces the shared session cookie. The session JWT lives for 12h of
+// *clock* time, so a cookie minted under a fake October clock in atDate()
+// is already expired once afterEach restores the real clock. Tests must
+// therefore never inherit a cookie across a clock change: beforeEach
+// re-logs-in on the real clock, and atDate() re-logs-in on its fake clock.
+async function login() {
+  const response = await request(
+    "/auth/login",
+    { password: env.APP_PASSWORD },
+    "POST",
+    false,
+  );
+  expect(response.status).toBe(200);
+  cookie = response.headers.get("Set-Cookie")!.split(";")[0];
+}
 beforeAll(async () => {
   mf = new Miniflare({
     modules: true,
@@ -100,14 +116,7 @@ beforeAll(async () => {
     APP_PASSWORD: "test-password-with-at-least-32-characters",
     ASSETS: { fetch: async () => new Response("app") } as unknown as Fetcher,
   };
-  const response = await request(
-    "/auth/login",
-    { password: env.APP_PASSWORD },
-    "POST",
-    false,
-  );
-  expect(response.status).toBe(200);
-  cookie = response.headers.get("Set-Cookie")!.split(";")[0];
+  await login();
 });
 afterAll(async () => {
   await mf?.dispose();
@@ -120,6 +129,10 @@ beforeEach(async (context) => {
   env.PHOTO_AI_ENABLED = undefined;
   env.GEMINI_PAID_TIER = undefined;
   env.GEMINI_API_KEY = undefined;
+  // Fresh session for every test on the current (real) clock, so a cookie
+  // issued under a previous test's fake clock can never leak in expired.
+  // Tests that pin a date call atDate(), which logs in again on that clock.
+  await login();
   for (const file of [
     "0001_schema.sql",
     "0002_seed.sql",
@@ -1271,13 +1284,9 @@ async function candidatePage(
 async function atDate(date: string) {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date(date + "T03:00:00Z"));
-  const login = await request(
-    "/auth/login",
-    { password: env.APP_PASSWORD },
-    "POST",
-    false,
-  );
-  cookie = login.headers.get("set-cookie")!.split(";")[0];
+  // Re-login on the fake clock so the token's exp is computed from, and
+  // verified against, the same mocked time while this test runs.
+  await login();
 }
 afterEach(() => {
   vi.useRealTimers();
