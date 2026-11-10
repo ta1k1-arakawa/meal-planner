@@ -225,4 +225,22 @@ describe("weight advice from 7-day averages", () => {
     expect(weightAdvice(logs([60, 60.2])).advice.action).toBe("insufficient");
     expect(weightAdvice([]).latestWeightKg).toBeNull();
   });
+  it("exposes a display average over the recorded days when fewer than 3 are logged", () => {
+    const summary = weightAdvice(logs([60, 60.2]));
+    expect(summary.recentLogDays).toBe(2);
+    expect(summary.recentAverageKg).toBe(60.1);
+    // The advice windows keep the >=3-days rule, so this stays null.
+    expect(summary.currentWeekAverageKg).toBeNull();
+    expect(summary.advice.action).toBe("insufficient");
+  });
+  it("matches the 7-day average once at least 3 days are recorded", () => {
+    const summary = weightAdvice(logs([60, 60.2, 60.4]));
+    expect(summary.recentLogDays).toBe(3);
+    expect(summary.recentAverageKg).toBe(60.2);
+    expect(summary.currentWeekAverageKg).toBe(60.2);
+  });
+  it("reports zero recorded days when there are no logs", () => {
+    expect(weightAdvice([]).recentLogDays).toBe(0);
+    expect(weightAdvice([]).recentAverageKg).toBeNull();
+  });
 });
