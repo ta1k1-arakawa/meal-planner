@@ -254,11 +254,26 @@ export function weightAdvice(
       latestWeightKg: null,
       currentWeekAverageKg: null,
       previousWeekAverageKg: null,
+      recentAverageKg: null,
+      recentLogDays: 0,
       weeklyChangeKg: null,
       previousWeeklyChangeKg: null,
       advice: insufficient,
     };
   const latest = sorted[sorted.length - 1];
+  // Display-only average over the recorded days in the current window.
+  // The advice computation below keeps requiring >=3 days per window.
+  const recentWindow = sorted.filter(
+    (l) =>
+      l.localDate > addDays(latest.localDate, -7) &&
+      l.localDate <= latest.localDate,
+  );
+  const recentAverageKg = recentWindow.length
+    ? round2(
+        recentWindow.reduce((sum, l) => sum + l.weightKg, 0) /
+          recentWindow.length,
+      )
+    : null;
   const average = (fromExclusive: string, toInclusive: string) => {
     const window = sorted.filter(
       (l) => l.localDate > fromExclusive && l.localDate <= toInclusive,
@@ -323,6 +338,8 @@ export function weightAdvice(
     latestWeightKg: latest.weightKg,
     currentWeekAverageKg: current,
     previousWeekAverageKg: previous,
+    recentAverageKg,
+    recentLogDays: recentWindow.length,
     weeklyChangeKg: weeklyChange,
     previousWeeklyChangeKg: previousWeeklyChange,
     advice,

@@ -16,6 +16,9 @@ import type {
   Cycle,
   Settings,
   MealLog,
+  SlotPlan,
+  WeightLog,
+  WeightSummary,
 } from "../worker/contracts";
 
 const recipes: Recipe[] = Array.from({ length: 30 }, (_, n) => ({
@@ -62,7 +65,40 @@ const settings: Settings = {
     morningDrink: { kcal: 200, protein: 7 },
   },
 };
+const slotRecipes: Record<string, Recipe> = {
+  lunch: { ...recipes[10], id: "lunch-recipe", slot: "lunch", title: "昼の料理" },
+  snack: { ...recipes[11], id: "snack-recipe", slot: "snack", title: "間食の料理" },
+  night_snack: {
+    ...recipes[12],
+    id: "night-recipe",
+    slot: "night_snack",
+    title: "夜食の料理",
+  },
+};
+const emptyWeightSummary: WeightSummary = {
+  latestWeightKg: null,
+  currentWeekAverageKg: null,
+  previousWeekAverageKg: null,
+  recentAverageKg: null,
+  recentLogDays: 0,
+  weeklyChangeKg: null,
+  previousWeeklyChangeKg: null,
+  advice: {
+    action: "insufficient",
+    deltaKcal: 0,
+    targetSlot: null,
+    message: "体重データが足りません。",
+  },
+};
+const nextDay = (d: string) => {
+  const t = new Date(d + "T00:00:00Z");
+  t.setUTCDate(t.getUTCDate() + 1);
+  return t.toISOString().slice(0, 10);
+};
 let plans: Plan[], logs: MealLog[], cycle: Cycle | null, date: string;
+let slotPlans: SlotPlan[];
+let weightPayload: { logs: WeightLog[]; summary: WeightSummary };
+let shoppingGenerates: boolean;
 let conflict: boolean, delay: Promise<void> | undefined;
 let refreshDelay: Promise<void> | undefined;
 let calls: { path: string; body: Record<string, unknown> | undefined }[];
@@ -74,6 +110,9 @@ const response = (data: unknown, status = 200) =>
 beforeEach(() => {
   date = "2026-10-13";
   logs = [];
+  slotPlans = [];
+  weightPayload = { logs: [], summary: emptyWeightSummary };
+  shoppingGenerates = false;
   conflict = false;
   delay = undefined;
   refreshDelay = undefined;
@@ -195,7 +234,55 @@ beforeEach(() => {
           };
         return response({ ok: true });
       }
-      if (path === "/shopping/today") return response(cycle);
+      if (path === "/shopping/today") {
+        if (shoppingGenerates)
+          for (let d = date; d <= "2026-10-16"; d = nextDay(d))
+            if (!plans.some((p) => p.local_date === d))
+              plans = [
+                ...plans,
+                {
+                  id: "gen-" + d,
+                  local_date: d,
+                  status: "planned",
+                  version: 0,
+                  recipe: recipes[1],
+                },
+              ];
+        return response(cycle);
+      }
+      if (path === "/day-plans") return response(slotPlans);
+      if (path === "/day-plans/generate") {
+        const made: SlotPlan[] = [];
+        for (let d = String(body.startDate); d <= "2026-10-16"; d = nextDay(d))
+          for (const slot of ["lunch", "snack", "night_snack"])
+            if (!slotPlans.some((sp) => sp.local_date === d && sp.slot === slot))
+              made.push({
+                id: "slot-" + d + "-" + slot,
+                local_date: d,
+                slot: slot as SlotPlan["slot"],
+                status: "planned",
+                version: 0,
+                recipe: slotRecipes[slot],
+              });
+        slotPlans = [...slotPlans, ...made];
+        return response({
+          startDate: body.startDate,
+          endDate: "2026-10-16",
+          created: made.length,
+          slotPlans,
+        });
+      }
+      if (path === "/body-weight-logs") return response(weightPayload);
+      if (path === "/costs/summary")
+        return response({
+          month: "2026-10",
+          budgetYen: 25000,
+          spentYen: 0,
+          remainingYen: 25000,
+          perDayYen: [],
+          today: { date, estimatedYen: 0, unknownIngredients: [] },
+          priceCaps: [],
+        });
       return response({ error: { message: "unexpected " + path } }, 404);
     }),
   );
@@ -351,6 +438,82 @@ describe("mobile daily flows", () => {
     ).toBeTruthy();
     expect(screen.getByText("食べた")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "記録" })).toBeNull();
+  });
+});
+
+describe("bulking production fixes", () => {
+  it("generates the current cycle on first load when nothing is planned yet", async () => {
+    plans = [plans[0]];
+    shoppingGenerates = true;
+    await start();
+    await screen.findByRole("heading", { name: "昼の料理" });
+    expect(screen.getByRole("heading", { name: "料理1" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "夜食の料理" })).toBeTruthy();
+    expect(calls.filter((c) => c.path === "/shopping/today")).toHaveLength(1);
+    expect(calls.filter((c) => c.path === "/day-plans/generate")).toHaveLength(
+      1,
+    );
+    // A later background refresh is read-only and must not generate again.
+    const planReads = calls.filter((c) => c.path === "/plans").length;
+    fireEvent(window, new Event("focus"));
+    await waitFor(() =>
+      expect(calls.filter((c) => c.path === "/plans").length).toBeGreaterThan(
+        planReads,
+      ),
+    );
+    expect(calls.filter((c) => c.path === "/shopping/today")).toHaveLength(1);
+    expect(calls.filter((c) => c.path === "/day-plans/generate")).toHaveLength(
+      1,
+    );
+  });
+  it("only fills the missing slots when today already has a dinner plan", async () => {
+    await start();
+    await screen.findByRole("heading", { name: "昼の料理" });
+    expect(calls.filter((c) => c.path === "/shopping/today")).toHaveLength(0);
+    expect(calls.filter((c) => c.path === "/day-plans/generate")).toHaveLength(
+      1,
+    );
+  });
+  it("shows every price cap in the shopping summary, not only listed items", async () => {
+    await start();
+    fireEvent.click(screen.getByRole("button", { name: "買い物" }));
+    fireEvent.click(screen.getByText("単価の目安（全食材）"));
+    expect(screen.getByText(/牛乳：1Lあたり240円まで/)).toBeTruthy();
+    expect(screen.getByText(/パスタ：1kgあたり250円まで/)).toBeTruthy();
+    expect(screen.getByText(/鶏肉：100gあたり110円まで/)).toBeTruthy();
+  });
+  it("shows a clear empty state on the weight card before any record", async () => {
+    await start();
+    expect(screen.getByText("まだ記録がありません。")).toBeTruthy();
+  });
+  it("shows the partial 7-day average labelled with the recorded day count", async () => {
+    weightPayload = {
+      logs: [
+        { local_date: "2026-10-12", weight_kg: 60 },
+        { local_date: date, weight_kg: 60.4 },
+      ],
+      summary: {
+        ...emptyWeightSummary,
+        latestWeightKg: 60.4,
+        recentAverageKg: 60.2,
+        recentLogDays: 2,
+      },
+    };
+    await start();
+    expect(screen.getByText(/最新体重 60\.4 kg/)).toBeTruthy();
+    expect(screen.getByText(/7日平均（記録2日分） 60\.2 kg/)).toBeTruthy();
+  });
+  it("shows the slot total next to the daily goal on Today and in Settings", async () => {
+    await start();
+    // Mock settings: 1150 + 450 + 325 + dinner 950 = 2875 kcal,
+    // protein 50 + 18 + 13 + dinner 40 = 121 g, daily goal stays 2800/110.
+    expect(
+      screen.getByText(/食事枠の合計（朝の飲み物は含まず） 2875 kcal \/ P 121 g/),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "設定" }));
+    expect(
+      screen.getByText(/枠の合計（朝の飲み物は含まず）：2875 kcal \/ P 121 g/),
+    ).toBeTruthy();
   });
 });
 

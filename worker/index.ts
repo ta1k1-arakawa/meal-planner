@@ -966,11 +966,24 @@ async function dailyNutrition(
       projected.protein += preset.protein_g;
     }
   }
-  const unknown = ["breakfast", "lunch", "snack", "bedtime"].filter(
-    (type) =>
-      !entries.some((e) => e.meal_type === type && e.status === "confirmed"),
-  );
+  // The unknown list follows the bulking slot model: lunch, snack, dinner
+  // and the night snack (stored meal_type "bedtime"). There is no breakfast
+  // slot; the optional morning drink (stored meal_type "breakfast") counts
+  // only on days where it is actually present — a morning-drink slot plan,
+  // a manual entry, or an enabled breakfast preset that serves food (the
+  // default "none" preset is 0 kcal and stays excluded).
+  const confirmedType = (type: string) =>
+    entries.some((e) => e.meal_type === type && e.status === "confirmed");
+  const morningPresent =
+    daySlotPlans.some((sp) => sp.slot === "morning_drink") ||
+    entries.some((e) => e.meal_type === "breakfast") ||
+    presets.some((p) => p.kind === "breakfast" && p.kcal > 0);
+  const unknown: string[] = [];
+  if (morningPresent && !confirmedType("breakfast")) unknown.push("breakfast");
+  if (!confirmedType("lunch")) unknown.push("lunch");
+  if (!confirmedType("snack")) unknown.push("snack");
   if (!log) unknown.push("dinner");
+  if (!confirmedType("bedtime")) unknown.push("bedtime");
   return { confirmed, projected, unknown, presets };
 }
 app.get("/api/daily-nutrition", async (c) =>

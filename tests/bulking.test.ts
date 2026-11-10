@@ -345,6 +345,46 @@ describe("weight tracking", () => {
     const after = await get<{ logs: unknown[] }>("/body-weight-logs");
     expect(after.logs).toHaveLength(21);
   });
+
+  it("reports a partial average over the recorded days before 3 days exist", async () => {
+    const today = tokyoDate();
+    await post("/body-weight-logs", {
+      localDate: addDays(today, -1),
+      weightKg: 60,
+    });
+    await post("/body-weight-logs", { localDate: today, weightKg: 60.4 });
+    const payload = await get<{ summary: WeightSummary }>("/body-weight-logs");
+    expect(payload.summary.latestWeightKg).toBe(60.4);
+    expect(payload.summary.currentWeekAverageKg).toBeNull();
+    expect(payload.summary.recentLogDays).toBe(2);
+    expect(payload.summary.recentAverageKg).toBe(60.2);
+    expect(payload.summary.advice.action).toBe("insufficient");
+  });
+});
+
+describe("daily nutrition unknown list", () => {
+  it("follows the slot model: no breakfast unless a morning drink is present", async () => {
+    await fill();
+    const today = tokyoDate();
+    const plain = await get<{ unknown: string[] }>(
+      "/daily-nutrition?date=" + today,
+    );
+    expect(plain.unknown).toEqual(["lunch", "snack", "dinner", "bedtime"]);
+    await post("/day-plans/generate", {
+      startDate: today,
+      includeMorningDrink: true,
+    });
+    const withDrink = await get<{ unknown: string[] }>(
+      "/daily-nutrition?date=" + today,
+    );
+    expect(withDrink.unknown).toEqual([
+      "breakfast",
+      "lunch",
+      "snack",
+      "dinner",
+      "bedtime",
+    ]);
+  });
 });
 
 describe("cost tracking and price caps", () => {

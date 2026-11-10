@@ -211,6 +211,13 @@ export interface WeightSummary {
   latestWeightKg: number | null;
   currentWeekAverageKg: number | null;
   previousWeekAverageKg: number | null;
+  /** Display-only average over the days actually recorded inside the
+   * current 7-day window (anchored at the latest log). Equals
+   * currentWeekAverageKg once 3+ days are recorded; the advice windows
+   * keep their >=3-days rule regardless. */
+  recentAverageKg: number | null;
+  /** Number of recorded days inside the current 7-day window. */
+  recentLogDays: number;
   weeklyChangeKg: number | null;
   previousWeeklyChangeKg: number | null;
   advice: {

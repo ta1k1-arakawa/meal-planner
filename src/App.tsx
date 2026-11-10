@@ -15,6 +15,7 @@ import type {
   CostSummary,
 } from "../worker/contracts";
 import {
+  PRICE_CAPS,
   priceCapFor,
   unitPriceYenPer100,
 } from "../worker/price-caps";
@@ -94,6 +95,7 @@ export function App() {
   const busy = operationBusy || photoBusy;
   const requestLock = useRef(false);
   const refreshPromise = useRef<Promise<Plan[]> | null>(null);
+  const autoGenerateAttempted = useRef(false);
   const shoppingVersion = useRef("");
   const candidateAnchor = useRef<{ id: string; top: number } | null>(null);
   const [shoppingEdited, setShoppingEdited] = useState(false);
@@ -172,6 +174,32 @@ export function App() {
       setShoppingEdited(false);
     }
     setAdjustIngredient((current) => current || st[0]?.id || "");
+    // First load only: if the current cycle has not been generated yet,
+    // run the same generation endpoints as the manual buttons so Today and
+    // Menu never open on an empty state that the shopping flow would fill
+    // anyway. Generation only creates projections for missing dates and
+    // never touches completed/skipped plans. Background refreshes stay
+    // read-only: this block runs once per mount, and the manual generate
+    // buttons remain as the fallback when it fails (e.g. a 409 because
+    // another tab generated first — the reload below then shows them).
+    if (!autoGenerateAttempted.current) {
+      autoGenerateAttempted.current = true;
+      const needsDinner = !to.plan;
+      const needsSlots = !dp.some((sp) => sp.local_date === to.date);
+      if (needsDinner || needsSlots) {
+        try {
+          if (needsDinner) await api("/shopping/today", {});
+          if (needsSlots)
+            await api("/day-plans/generate", {
+              startDate: to.date,
+              includeMorningDrink: false,
+            });
+          return fetchLatest();
+        } catch {
+          /* Manual generate buttons remain available as the fallback. */
+        }
+      }
+    }
     return pl;
   }
   useEffect(() => {
@@ -559,6 +587,22 @@ export function App() {
         )}
       </main>
     );
+  // Per-slot targets are guides for each meal, so their sum can differ
+  // from the headline daily goal. Show both numbers where they appear
+  // together instead of letting them look contradictory. The optional
+  // morning drink is a top-up and is not part of the slot sum.
+  const slotKcalTotal = settings
+    ? settings.slotTargets.lunch.kcal +
+      settings.slotTargets.snack.kcal +
+      settings.slotTargets.nightSnack.kcal +
+      settings.dinnerKcal
+    : 0;
+  const slotProteinTotal = settings
+    ? settings.slotTargets.lunch.protein +
+      settings.slotTargets.snack.protein +
+      settings.slotTargets.nightSnack.protein +
+      settings.dinnerProtein
+    : 0;
   return (
     <>
       <header>
@@ -657,16 +701,20 @@ export function App() {
                 1日の目標 {settings?.dailyKcal} kcal / P{" "}
                 {settings?.dailyProtein} g（初期推定）
               </p>
+              <p className="muted">
+                食事枠の合計（朝の飲み物は含まず） {slotKcalTotal} kcal / P{" "}
+                {slotProteinTotal} g
+              </p>
               <p>
                 未確認：
                 {today?.nutrition.unknown
                   .map(
                     (s) =>
                       ({
-                        breakfast: "朝食",
+                        breakfast: "朝の飲み物",
                         lunch: "昼食",
                         snack: "間食",
-                        bedtime: "就寝前",
+                        bedtime: "夜食",
                         dinner: "夕食",
                       })[s as "lunch"],
                   )
@@ -710,16 +758,33 @@ export function App() {
               weight?.summary.latestWeightKg !== undefined ? (
                 <>
                   <p>
-                    最新 {weight.summary.latestWeightKg} kg · 7日平均{" "}
-                    {weight.summary.currentWeekAverageKg ?? "—"} kg（前週平均{" "}
-                    {weight.summary.previousWeekAverageKg ?? "—"} kg）
+                    最新体重 {weight.summary.latestWeightKg} kg
+                    {weight.logs.length
+                      ? `（${weight.logs[weight.logs.length - 1].local_date}）`
+                      : ""}
                   </p>
+                  {weight.summary.currentWeekAverageKg !== null ? (
+                    <p>
+                      7日平均 {weight.summary.currentWeekAverageKg} kg（前週平均{" "}
+                      {weight.summary.previousWeekAverageKg ?? "—"} kg）
+                    </p>
+                  ) : (
+                    <p>
+                      7日平均（記録{weight.summary.recentLogDays}日分）{" "}
+                      {weight.summary.recentAverageKg} kg
+                    </p>
+                  )}
                   <p className="notice">{weight.summary.advice.message}</p>
                 </>
               ) : (
-                <p className="muted">
-                  毎朝、起床後トイレのあとに測って記録してください。7日平均で増量ペースを判定します。
-                </p>
+                <>
+                  {weight ? (
+                    <p className="muted">まだ記録がありません。</p>
+                  ) : null}
+                  <p className="muted">
+                    毎朝、起床後トイレのあとに測って記録してください。7日平均で増量ペースを判定します。
+                  </p>
+                </>
               )}
               <form
                 onSubmit={(e) => {
@@ -1022,6 +1087,16 @@ export function App() {
                 .join("・")}
               曜日。予定の料理は変えず、不足分だけ計算します。
             </p>
+            <details className="price-caps">
+              <summary>単価の目安（全食材）</summary>
+              <ul>
+                {PRICE_CAPS.map((cap) => (
+                  <li key={cap.ingredientId}>
+                    {cap.label}：{cap.limitText}
+                  </li>
+                ))}
+              </ul>
+            </details>
             {cycle ? (
               <section className="card">
                 <p>
@@ -1299,6 +1374,19 @@ function SettingsForm({
         ))}
         <fieldset>
           <legend>食事枠ごとの目標（朝食はなし）</legend>
+          <p className="muted">
+            枠の合計（朝の飲み物は含まず）：
+            {s.slotTargets.lunch.kcal +
+              s.slotTargets.snack.kcal +
+              s.slotTargets.nightSnack.kcal +
+              s.dinnerKcal}{" "}
+            kcal / P{" "}
+            {s.slotTargets.lunch.protein +
+              s.slotTargets.snack.protein +
+              s.slotTargets.nightSnack.protein +
+              s.dinnerProtein}{" "}
+            g（枠ごとの目安の合計で、1日の目標とは別に管理します）
+          </p>
           {slotFields.map(([key, label]) => (
             <div key={key}>
               <label>
@@ -1442,7 +1530,7 @@ function SettingsForm({
         </button>
       </form>
       <p className="muted">
-        日本時間（Asia/Tokyo）。朝食なし・就寝前プロテインは未確認の予測です。プリセット編集と写真取り込みは後続の実装範囲です。
+        日本時間（Asia/Tokyo）。朝食なし・夜食は未確認の予測です。プリセット編集と写真取り込みは後続の実装範囲です。
       </p>
     </section>
   );
