@@ -142,9 +142,12 @@ beforeEach(async (context) => {
     "0006_anytime_shopping.sql",
     "0007_photo_purchases.sql",
     "0008_bulking.sql",
+    "0009_more_bulking_recipes.sql",
   ]) {
     if (
-      (file.startsWith("0007") || file.startsWith("0008")) &&
+      (file.startsWith("0007") ||
+        file.startsWith("0008") ||
+        file.startsWith("0009")) &&
       context.task.name.startsWith("preserves populated 0006")
     )
       continue;
@@ -153,7 +156,8 @@ beforeEach(async (context) => {
         file.startsWith("0005") ||
         file.startsWith("0006") ||
         file.startsWith("0007") ||
-        file.startsWith("0008")) &&
+        file.startsWith("0008") ||
+        file.startsWith("0009")) &&
       context.task.name.startsWith("upgrades populated")
     )
       continue;
@@ -361,8 +365,9 @@ describe("cycle planner and shopping", () => {
     const recipes = (await get<Plan["recipe"][]>("/recipes")).filter(
       (r) => r.slot === "dinner",
     );
-    // 30 original dinners plus 5 bulking dinners from migration 0008.
-    expect(recipes).toHaveLength(35);
+    // 30 original dinners plus 5 bulking dinners from migration 0008
+    // and 5 more from migration 0009.
+    expect(recipes).toHaveLength(40);
     for (const r of recipes) {
       expect(r.total_minutes).toBeLessThanOrEqual(30);
       expect(r.kcal).toBeGreaterThan(650);
@@ -824,11 +829,11 @@ describe("meal completion, concurrency and snapshots", () => {
 
 describe("pantry classification and recipe detail acceptance", () => {
   const exempt = ["oil", "soy", "miso", "sugar", "curry"];
-  it("shows names, canonical amounts and specific steps for every one of the 47 recipes", async () => {
+  it("shows names, canonical amounts and specific steps for every one of the 62 recipes", async () => {
     const catalog = await get<Plan["recipe"][]>("/recipes"),
       ingredients = await loadIngredients(database),
       stocks = await get<Stock[]>("/inventory");
-    expect(catalog).toHaveLength(47);
+    expect(catalog).toHaveLength(62);
     for (const recipe of catalog) {
       const steps = JSON.parse(recipe.instructions_json).join("\n");
       expect(steps).not.toContain("{{");

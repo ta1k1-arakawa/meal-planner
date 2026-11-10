@@ -2,7 +2,7 @@ import { beforeAll, afterAll, beforeEach, describe, expect, it } from "vitest";
 import { Miniflare } from "miniflare";
 import { readFileSync } from "node:fs";
 import app, { type Env } from "../worker/index";
-import { tokyoDate, cycleEnd, addDays, nextShoppingDate } from "../worker/planner";
+import { tokyoDate, cycleEnd, addDays, nextShoppingDate, chooseSlotRecipe } from "../worker/planner";
 import { exceedsCap, unitPriceYenPer100 } from "../worker/price-caps";
 import type {
   Cycle,
@@ -25,6 +25,7 @@ const MIGRATIONS = [
   "0006_anytime_shopping.sql",
   "0007_photo_purchases.sql",
   "0008_bulking.sql",
+  "0009_more_bulking_recipes.sql",
 ];
 async function applyMigration(file: string, db: D1Database) {
   const sql = readFileSync(
@@ -134,7 +135,7 @@ describe("bulking v2 profile and catalog", () => {
 
   it("seeds bulking recipes per slot near their targets, with every item in the steps", async () => {
     const catalog = await get<Plan["recipe"][]>("/recipes");
-    expect(catalog).toHaveLength(47);
+    expect(catalog).toHaveLength(62);
     const bySlot = (slot: string) => catalog.filter((r) => r.slot === slot);
     expect(bySlot("lunch").map((r) => r.id)).toEqual(
       expect.arrayContaining([
@@ -143,6 +144,10 @@ describe("bulking v2 profile and catalog", () => {
         "bulk-teriyaki-don",
         "bulk-yakisoba",
         "bulk-tuna-natto-don",
+        "bulk2-chicken-soboro-don",
+        "bulk2-tuna-egg-cheese-don",
+        "bulk2-salmon-mayo-don",
+        "bulk2-keema-curry-don",
       ]),
     );
     expect(bySlot("dinner").map((r) => r.id)).toEqual(
@@ -152,9 +157,33 @@ describe("bulking v2 profile and catalog", () => {
         "bulk-pork-ginger",
         "bulk-chicken-nanban",
         "bulk-niku-udon",
+        "bulk2-saba-miso-set",
+        "bulk2-chicken-hoikoro-don",
+        "bulk2-tofu-hamburg-don",
+        "bulk2-tuna-tomato-pasta",
+        "bulk2-pork-sukiyaki-don",
+      ]),
+    );
+    expect(bySlot("snack").map((r) => r.id)).toEqual(
+      expect.arrayContaining([
+        "bulk2-natto-cheese-toast",
+        "bulk2-egg-banana-milk",
+        "bulk2-egg-sandwich",
+      ]),
+    );
+    expect(bySlot("night_snack").map((r) => r.id)).toEqual(
+      expect.arrayContaining([
+        "bulk2-night-miso-soup-rice",
+        "bulk2-night-banana-yogurt",
+        "bulk2-night-natto-egg-rice",
       ]),
     );
     for (const r of bySlot("lunch")) {
+      expect(r.kcal).toBeGreaterThanOrEqual(1000);
+      expect(r.kcal).toBeLessThanOrEqual(1250);
+      expect(r.protein).toBeGreaterThanOrEqual(40);
+    }
+    for (const r of bySlot("dinner").filter((x) => x.id.includes("bulk"))) {
       expect(r.kcal).toBeGreaterThanOrEqual(1000);
       expect(r.kcal).toBeLessThanOrEqual(1250);
       expect(r.protein).toBeGreaterThanOrEqual(40);
@@ -167,6 +196,7 @@ describe("bulking v2 profile and catalog", () => {
     for (const r of bySlot("night_snack")) {
       expect(r.kcal).toBeGreaterThanOrEqual(280);
       expect(r.kcal).toBeLessThanOrEqual(380);
+      expect(r.protein).toBeGreaterThanOrEqual(11);
     }
     for (const r of catalog.filter((x) => x.id.includes("bulk") || x.slot !== "dinner" || x.id.startsWith("snack") || x.id.startsWith("night") || x.id.startsWith("morning"))) {
       const steps = JSON.parse(r.instructions_json).join("\n");
@@ -181,6 +211,40 @@ describe("bulking v2 profile and catalog", () => {
           ["oatmeal", "peanut_butter"].includes(i.ingredientId),
         ),
       ).toBe(false);
+  });
+
+  it("selects a new 0009 recipe when only its ingredients are in stock", async () => {
+    const catalog = await get<Plan["recipe"][]>("/recipes");
+    const s = await get<Settings>("/settings");
+    // Stock-only selection (no purchases): the new salmon lunch is the only
+    // lunch whose managed ingredients are fully covered by this stock.
+    const lunch = chooseSlotRecipe(
+      catalog.filter((r) => r.slot === "lunch"),
+      new Map([
+        ["rice", 400],
+        ["salmon", 150],
+        ["egg", 50],
+        ["broccoli", 100],
+      ]),
+      [],
+      s.slotTargets.lunch,
+      false,
+    );
+    expect(lunch.id).toBe("bulk2-salmon-mayo-don");
+    // Same for the new banana-yogurt night snack (the older yogurt recipe
+    // needs 400 g of yogurt, more than the 320 g stocked here).
+    const night = chooseSlotRecipe(
+      catalog.filter((r) => r.slot === "night_snack"),
+      new Map([
+        ["yogurt", 320],
+        ["banana", 90],
+        ["honey", 15],
+      ]),
+      [],
+      s.slotTargets.nightSnack,
+      false,
+    );
+    expect(night.id).toBe("bulk2-night-banana-yogurt");
   });
 });
 
@@ -480,6 +544,16 @@ describe("migration 0008 upgrade safety", () => {
       expect(plan?.recipe.id).toBe("chicken-ginger");
       expect(plan?.recipe.slot).toBe("dinner");
       expect(await get<SlotPlan[]>("/day-plans")).toEqual([]);
+      // Migration 0009 then adds the second bulking recipe batch without
+      // touching the preserved data.
+      await applyMigration("0009_more_bulking_recipes.sql", upgradeDb);
+      expect(await get<Plan["recipe"][]>("/recipes")).toHaveLength(62);
+      const riceAfter = await upgradeDb
+        .prepare(
+          "SELECT quantity FROM inventory_stocks WHERE ingredient_id='rice'",
+        )
+        .first<{ quantity: number }>();
+      expect(riceAfter?.quantity).toBe(1234);
     } finally {
       env.DB = database;
     }
